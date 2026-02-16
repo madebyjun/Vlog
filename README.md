@@ -124,11 +124,14 @@ SSD_UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX ./newvlog.sh
 - 既存を使うか、新規プロジェクトを作るかを選択
 - 新規作成時:
   - タイトル入力（未入力時は `NewProject`）
+  - タイトル許可文字: 英数字 / 日本語（ひらがな・カタカナ・漢字）/ 空白 / `.` / `_` / `-`
+  - 禁止例: `/`, `..`, 先頭 `-`, 制御文字
   - Tier選択
     - `TIER_1__KEEP`
     - `TIER_2__STORE`
     - `TIER_3__TEMP`
   - 既存名と重複時は `-1`, `-2` ... を付けて作成
+  - 作成先は必ず選択した Tier 配下になるよう検証
   - `_Template` があれば内容をコピー
   - `_Assets` があれば `Assets` シンボリックリンクを作成
 
