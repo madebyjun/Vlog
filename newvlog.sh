@@ -71,6 +71,11 @@ parse_local_config() {
         if [[ ("${value[1]}" == "\"" && "${value[-1]}" == "\"") || ("${value[1]}" == "'" && "${value[-1]}" == "'") ]]; then
             value="${value[2,-2]}"
             value="$(trim_whitespace "$value")"
+
+            if [[ -z "$value" ]]; then
+                print "❌ .newvlog.local:${line_no}: SSD_UUID が空です。"
+                exit 1
+            fi
         fi
 
         if ! is_valid_ssd_uuid "$value"; then
