@@ -20,11 +20,77 @@ LOCAL_CONFIG_FILE="$(cd "$(dirname "$0")" && pwd)/.newvlog.local"
 ENV_SSD_UUID="${SSD_UUID:-}"
 SSD_UUID=""
 
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    print -r -- "$value"
+}
+
+is_valid_ssd_uuid() {
+    local value="$1"
+    [[ "$value" =~ ^[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}$ ]]
+}
+
+parse_local_config() {
+    local file="$1"
+    local line=""
+    local key=""
+    local value=""
+    local line_no=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_no=$((line_no + 1))
+        line="$(trim_whitespace "$line")"
+        [[ -z "$line" ]] && continue
+        [[ "$line" == \#* ]] && continue
+
+        if [[ "$line" != *=* ]]; then
+            print "❌ .newvlog.local:${line_no}: 無効な形式です。KEY=VALUE 形式で記述してください。"
+            exit 1
+        fi
+
+        key="$(trim_whitespace "${line%%=*}")"
+        value="$(trim_whitespace "${line#*=}")"
+
+        if [[ -z "$key" ]]; then
+            print "❌ .newvlog.local:${line_no}: キー名が空です。"
+            exit 1
+        fi
+
+        if [[ "$key" != "SSD_UUID" ]]; then
+            print "⚠️  .newvlog.local:${line_no}: 未知のキー '${key}' は無視します。"
+            continue
+        fi
+
+        if [[ -z "$value" ]]; then
+            print "❌ .newvlog.local:${line_no}: SSD_UUID が空です。"
+            exit 1
+        fi
+
+        if [[ ("${value[1]}" == "\"" && "${value[-1]}" == "\"") || ("${value[1]}" == "'" && "${value[-1]}" == "'") ]]; then
+            value="${value[2,-2]}"
+            value="$(trim_whitespace "$value")"
+        fi
+
+        if ! is_valid_ssd_uuid "$value"; then
+            print "❌ .newvlog.local:${line_no}: SSD_UUID の形式が不正です: $value"
+            exit 1
+        fi
+
+        SSD_UUID="$value"
+    done < "$file"
+}
+
 if [[ -f "$LOCAL_CONFIG_FILE" ]]; then
-    source "$LOCAL_CONFIG_FILE"
+    parse_local_config "$LOCAL_CONFIG_FILE"
 fi
 
 if [[ -n "$ENV_SSD_UUID" ]]; then
+    if ! is_valid_ssd_uuid "$ENV_SSD_UUID"; then
+        print "❌ 環境変数 SSD_UUID の形式が不正です: $ENV_SSD_UUID"
+        exit 1
+    fi
     SSD_UUID="$ENV_SSD_UUID"
 fi
 
@@ -35,10 +101,18 @@ while (( $# > 0 )); do
                 print "❌ --ssd-uuid にはUUIDを指定してください。"
                 exit 1
             fi
+            if ! is_valid_ssd_uuid "$2"; then
+                print "❌ --ssd-uuid の形式が不正です: $2"
+                exit 1
+            fi
             SSD_UUID="$2"
             shift 2
             ;;
         --ssd-uuid=*)
+            if ! is_valid_ssd_uuid "${1#*=}"; then
+                print "❌ --ssd-uuid の形式が不正です: ${1#*=}"
+                exit 1
+            fi
             SSD_UUID="${1#*=}"
             shift
             ;;
