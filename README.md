@@ -136,7 +136,8 @@ SSD_UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX ./newvlog.sh
 
 - 転送は `rsync -a --progress`
 - 除外パターン: `*.LRF`
-- 転送成功時のみ `.import_history` に `DEVICE_NAME:ファイル名` を追記
+- 転送成功時のみ `.import_history` に `v2:<安定デバイスID>:<ファイル名>` を追記
+- 重複判定では旧形式 `DEVICE_NAME:ファイル名` も互換参照（段階移行）
 
 ### 実行後
 

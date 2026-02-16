@@ -179,6 +179,63 @@ select_tier() {
     echo "${TIER_FOLDERS[$tier_choice]}"
 }
 
+get_volume_uuid() {
+    local volume_path="$1"
+    local volume_info=""
+    local volume_uuid=""
+
+    volume_info="$(diskutil info "$volume_path" 2>/dev/null || true)"
+    volume_uuid="$(echo "$volume_info" | grep "Volume UUID" | cut -d: -f2- | xargs || true)"
+    print -r -- "$volume_uuid"
+}
+
+build_device_stable_id() {
+    local volume_path="$1"
+    local source_dir="$2"
+    local volume_uuid=""
+    local source_parent_real=""
+    local source_real=""
+
+    volume_uuid="$(get_volume_uuid "$volume_path")"
+    if [[ -n "$volume_uuid" ]]; then
+        print -r -- "voluuid:${volume_uuid}"
+        return
+    fi
+
+    source_parent_real="$(cd "$(dirname "$source_dir")" 2>/dev/null && pwd -P)" || source_parent_real=""
+    if [[ -n "$source_parent_real" ]]; then
+        source_real="${source_parent_real}/$(basename "$source_dir")"
+    else
+        source_real="$source_dir"
+    fi
+    print -r -- "path:${source_real}"
+}
+
+build_history_key_v2() {
+    local stable_id="$1"
+    local file_name="$2"
+    print -r -- "v2:${stable_id}:${file_name}"
+}
+
+build_history_key_legacy() {
+    local device_name="$1"
+    local file_name="$2"
+    print -r -- "${device_name}:${file_name}"
+}
+
+is_imported_file() {
+    local stable_id="$1"
+    local device_name="$2"
+    local file_name="$3"
+    local history_key_v2=""
+    local history_key_legacy=""
+
+    history_key_v2="$(build_history_key_v2 "$stable_id" "$file_name")"
+    history_key_legacy="$(build_history_key_legacy "$device_name" "$file_name")"
+
+    [[ -n "${imported_files[$history_key_v2]}" || -n "${imported_files[$history_key_legacy]}" ]]
+}
+
 
 # ==========================================
 # 1. SSD準備 & 履歴ロード
@@ -223,7 +280,7 @@ for vol in /Volumes/*(N/); do
 done
 
 # デバイス種別ごとの検出結果を格納
-typeset -a DETECTED_DEVICES  # "DEVICE_NAME|SOURCE_DIR|DEST_FOLDER|DATE_REGEX" の配列
+typeset -a DETECTED_DEVICES  # "DEVICE_NAME|SOURCE_DIR|DEST_FOLDER|DATE_REGEX|DEVICE_STABLE_ID" の配列
 
 osmo_count=0
 mic_count=0
@@ -232,13 +289,17 @@ for vol in $ALL_VOLUMES; do
     # OsmoAction 検出
     if [[ -d "$vol/$OSMO_DETECT_PATH" ]] && (( osmo_count < ${#OSMO_DEST_DIRS} )); then
         osmo_count=$((osmo_count + 1))
-        DETECTED_DEVICES+=("OsmoAction_${osmo_count}|${vol}/${OSMO_SOURCE_PATH}|${OSMO_DEST_DIRS[$osmo_count]}|${OSMO_DATE_REGEX}")
+        source_dir="${vol}/${OSMO_SOURCE_PATH}"
+        stable_id="$(build_device_stable_id "$vol" "$source_dir")"
+        DETECTED_DEVICES+=("OsmoAction_${osmo_count}|${source_dir}|${OSMO_DEST_DIRS[$osmo_count]}|${OSMO_DATE_REGEX}|${stable_id}")
     fi
 
     # DJI Mic 検出
     if [[ -d "$vol/$MIC_DETECT_PATH" ]] && (( mic_count < ${#MIC_DEST_DIRS} )); then
         mic_count=$((mic_count + 1))
-        DETECTED_DEVICES+=("DJI_Mic_${mic_count}|${vol}/${MIC_SOURCE_PATH}|${MIC_DEST_DIRS[$mic_count]}|${MIC_DATE_REGEX}")
+        source_dir="${vol}/${MIC_SOURCE_PATH}"
+        stable_id="$(build_device_stable_id "$vol" "$source_dir")"
+        DETECTED_DEVICES+=("DJI_Mic_${mic_count}|${source_dir}|${MIC_DEST_DIRS[$mic_count]}|${MIC_DATE_REGEX}|${stable_id}")
     fi
 done
 
@@ -259,7 +320,10 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
     SOURCE_DIR="${_rest%%|*}"
     _rest="${_rest#*|}"
     DEST_FOLDER_NAME="${_rest%%|*}"
-    DATE_REGEX="${_rest#*|}"
+    _rest="${_rest#*|}"
+    DATE_REGEX="${_rest%%|*}"
+    DEVICE_STABLE_ID="${_rest#*|}"
+    [[ -z "$DEVICE_STABLE_ID" ]] && DEVICE_STABLE_ID="device:${DEVICE_NAME}"
 
     print "\n════════════════════════════════════════════"
     print "📡 $DEVICE_NAME チェック中..."
@@ -278,9 +342,8 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
         [[ -f "$f" ]] || continue
         fname=$(basename "$f")
 
-        # 【変更点1】履歴チェック (デバイス名:ファイル名 で照合)
-        history_key="${DEVICE_NAME}:${fname}"
-        if [[ -n "${imported_files[$history_key]}" ]]; then
+        # 履歴チェック (v2キー + 旧キー互換)
+        if is_imported_file "$DEVICE_STABLE_ID" "$DEVICE_NAME" "$fname"; then
             continue
         fi
 
@@ -431,9 +494,8 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
             [[ -f "$f" ]] || continue
             fname=$(basename "$f")
 
-            # 履歴チェック
-            history_key="${DEVICE_NAME}:${fname}"
-            if [[ -n "${imported_files[$history_key]}" ]]; then
+            # 履歴チェック (v2キー + 旧キー互換)
+            if is_imported_file "$DEVICE_STABLE_ID" "$DEVICE_NAME" "$fname"; then
                 continue
             fi
 
@@ -461,7 +523,9 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
                 # この日付がTARGET_DATEと一致する場合のみ転送
                 if [[ "$formatted_date" == "$TARGET_DATE" ]]; then
                     if rsync -a --progress "$f" "$DEST_SUB/"; then
-                        echo "${DEVICE_NAME}:${fname}" >> "$HISTORY_FILE"
+                        history_key_v2="$(build_history_key_v2 "$DEVICE_STABLE_ID" "$fname")"
+                        echo "$history_key_v2" >> "$HISTORY_FILE"
+                        imported_files[$history_key_v2]=1
                         ((count_done++)) || true
                     else
                         print "⚠️ 転送失敗: $fname"
