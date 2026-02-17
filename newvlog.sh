@@ -430,28 +430,44 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
         if (( ${#existing_dirs} > 0 )); then
             print "  ⚡️ 既存プロジェクトが見つかりました:"
             choices=()
-            for d in $existing_dirs; do
-                choices+=($(basename "$d"))
+            for d in "${existing_dirs[@]}"; do
+                choices+=("$(basename -- "$d")")
             done
             
             i=1
-            for c in $choices; do
+            for c in "${choices[@]}"; do
                 print "    [$i] $c"
                 ((i++))
             done
             print "    [0] 新しいプロジェクトを作成"
-            
-            print -n "  👉 番号を選択: "
-            read sel
 
-            if [[ "$sel" -gt 0 && "$sel" -le "${#choices}" ]]; then
-                TARGET_PROJECT_DIR="${existing_dirs[$sel]}"
-            else
-                IS_NEW_PROJECT=true
-            fi
+            while true; do
+                print -n "  👉 番号を選択: "
+                read sel
+
+                if [[ "$sel" == "0" ]]; then
+                    IS_NEW_PROJECT=true
+                    break
+                fi
+
+                if [[ "$sel" =~ ^[0-9]+$ ]] && [[ "$sel" -ge 1 && "$sel" -le "${#choices}" ]]; then
+                    TARGET_PROJECT_DIR="${existing_dirs[$sel]}"
+                    if [[ -n "$TARGET_PROJECT_DIR" ]]; then
+                        IS_NEW_PROJECT=false
+                        break
+                    fi
+                fi
+
+                print "  ⚠️  無効な入力です。0〜${#choices} の番号を入力してください。"
+            done
         else
             print "  🆕 新規作成"
             IS_NEW_PROJECT=true
+        fi
+
+        if ! $IS_NEW_PROJECT && [[ -z "$TARGET_PROJECT_DIR" ]]; then
+            print "❌ 既存プロジェクトの選択結果が空です。再実行してください。"
+            exit 1
         fi
 
         if $IS_NEW_PROJECT; then

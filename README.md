@@ -126,6 +126,7 @@ SSD_UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX ./newvlog.sh
 - 日付・時刻はファイル名の正規表現から抽出
 - `CUTOFF_TIME=04:00` より前の時刻は前日扱い
 - 日付ごとに既存プロジェクト（`<YYYY-MM-DD>-*`）を全Tierから検索
+- 空白を含む既存プロジェクト名でも、表示番号と選択先が正しく一致
 - 既存を使うか、新規プロジェクトを作るかを選択
 - 新規作成時:
   - タイトル入力（未入力時は `NewProject`）
