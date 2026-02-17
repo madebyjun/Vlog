@@ -57,11 +57,16 @@ chmod +x ./newvlog.sh
 3. ローカル設定ファイル: `.newvlog.local`
 
 `.newvlog.local` は `newvlog.sh` と同じディレクトリで読み込まれます（`.gitignore` 対象）。
+読み込みは `KEY=VALUE` 専用パーサーで行われ、シェルコードは実行されません。
 
 ```bash
 # .newvlog.local
 SSD_UUID="XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
 ```
+
+- 利用されるキーは `SSD_UUID` のみ
+- 未知キーは警告表示して無視
+- 構文不正（`KEY=VALUE` 以外）や UUID 形式不正はエラー終了
 
 UUID は例えば次で確認できます。
 
