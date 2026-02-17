@@ -57,11 +57,16 @@ chmod +x ./newvlog.sh
 3. ローカル設定ファイル: `.newvlog.local`
 
 `.newvlog.local` は `newvlog.sh` と同じディレクトリで読み込まれます（`.gitignore` 対象）。
+読み込みは `KEY=VALUE` 専用パーサーで行われ、シェルコードは実行されません。
 
 ```bash
 # .newvlog.local
 SSD_UUID="XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
 ```
+
+- 利用されるキーは `SSD_UUID` のみ
+- 未知キーは警告表示して無視
+- 構文不正（`KEY=VALUE` 以外）や UUID 形式不正はエラー終了
 
 UUID は例えば次で確認できます。
 
@@ -121,6 +126,7 @@ SSD_UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX ./newvlog.sh
 - 日付・時刻はファイル名の正規表現から抽出
 - `CUTOFF_TIME=04:00` より前の時刻は前日扱い
 - 日付ごとに既存プロジェクト（`<YYYY-MM-DD>-*`）を全Tierから検索
+- 空白を含む既存プロジェクト名でも、表示番号と選択先が正しく一致
 - 既存を使うか、新規プロジェクトを作るかを選択
 - 新規作成時:
   - タイトル入力（未入力時は `NewProject`）
@@ -139,7 +145,8 @@ SSD_UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX ./newvlog.sh
 
 - 転送は `rsync -a --progress`
 - 除外パターン: `*.LRF`
-- 転送成功時のみ `.import_history` に `DEVICE_NAME:ファイル名` を追記
+- 転送成功時のみ `.import_history` に `v2:<安定デバイスID>:<ファイル名>` を追記
+- 重複判定では旧形式 `DEVICE_NAME:ファイル名` も互換参照（段階移行）
 
 ### 実行後
 
