@@ -258,6 +258,39 @@ select_tier() {
     echo "${TIER_FOLDERS[$tier_choice]}"
 }
 
+is_valid_project_title() {
+    local title="$1"
+
+    [[ -z "$title" ]] && return 1
+    [[ "$title" == -* ]] && return 1
+    [[ "$title" == *"/"* ]] && return 1
+    [[ "$title" == *".."* ]] && return 1
+
+    if printf '%s' "$title" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        return 1
+    fi
+
+    if ! printf '%s' "$title" | grep -Eq '^[A-Za-z0-9._ ぁ-んァ-ン一-龥々ー\-]+$'; then
+        return 1
+    fi
+
+    return 0
+}
+
+is_path_within_tier() {
+    local tier_path="$1"
+    local target_path="$2"
+    local tier_real=""
+    local parent_real=""
+    local target_real=""
+
+    tier_real="$(cd "$tier_path" 2>/dev/null && pwd -P)" || return 1
+    parent_real="$(cd "$(dirname "$target_path")" 2>/dev/null && pwd -P)" || return 1
+    target_real="${parent_real}/$(basename "$target_path")"
+
+    [[ "$target_real" == "$tier_real" || "$target_real" == "$tier_real"/* ]]
+}
+
 get_volume_uuid() {
     local volume_path="$1"
     local volume_info=""
@@ -534,10 +567,6 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
         fi
 
         if $IS_NEW_PROJECT; then
-            print -n "  🏷  タイトルを入力: "
-            read USER_TITLE
-            TITLE="${USER_TITLE:-$DEFAULT_TITLE}"
-
             # Select tier for new project
             SELECTED_TIER=$(select_tier)
             TIER_PATH="$FOOTAGE_ROOT/$SELECTED_TIER"
@@ -548,7 +577,24 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
                 mkdir -p "$TIER_PATH"
             fi
 
+            while true; do
+                print -n "  🏷  タイトルを入力: "
+                read USER_TITLE
+                TITLE="${USER_TITLE:-$DEFAULT_TITLE}"
+
+                if ! is_valid_project_title "$TITLE"; then
+                    print "  ⚠️  タイトルに使えない文字列です。英数/日本語/空白/._- のみ利用可能です。"
+                    print "      禁止例: '/', '..', 先頭 '-'"
+                    continue
+                fi
+                break
+            done
+
             BASE_DIR="${TIER_PATH}/${TARGET_DATE}-${TITLE}"
+            if ! is_path_within_tier "$TIER_PATH" "$BASE_DIR"; then
+                print "❌ 作成先パスがTier配下に収まりません: $BASE_DIR"
+                exit 1
+            fi
             TARGET_PROJECT_DIR="$BASE_DIR"
 
             count=1
@@ -556,6 +602,11 @@ for DEVICE_ENTRY in $DETECTED_DEVICES; do
                 TARGET_PROJECT_DIR="${BASE_DIR}-${count}"
                 count=$((count + 1))
             done
+
+            if ! is_path_within_tier "$TIER_PATH" "$TARGET_PROJECT_DIR"; then
+                print "❌ 最終作成先パスがTier配下に収まりません: $TARGET_PROJECT_DIR"
+                exit 1
+            fi
 
             mkdir -p "$TARGET_PROJECT_DIR"
             [[ -d "$TEMPLATE_DIR" ]] && cp -R "$TEMPLATE_DIR"/. "$TARGET_PROJECT_DIR"
