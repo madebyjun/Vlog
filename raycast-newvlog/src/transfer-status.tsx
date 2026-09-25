@@ -14,16 +14,64 @@ import {
 import { getProgressIcon, usePromise } from "@raycast/utils";
 import path from "node:path";
 import { formatEta, formatGib, formatPercent, formatSpeed } from "./lib/format";
+import { readHistory } from "./lib/history";
 import { cancelJob, clearJob, readJob } from "./lib/job";
 import { progressStats } from "./lib/progress";
-import { raycastJobPaths } from "./lib/runtime";
+import { logDirPath, raycastJobPaths } from "./lib/runtime";
 import { OUTCOME, displayState, groupIcon, groupLabel, outcomeOf, projectDirsOf } from "./views/status";
 
-// メニューバーの転送状況。転送中・結果未確認のジョブがあるときだけ表示する。
+// メニューバーの転送状況。転送中は進捗、終了後は結果、何もしていないときは前回の取り込みを表示する。
 // Raycast が一定間隔 (package.json の interval) と、メニューを開いたときに再実行する。
 
 async function openImport() {
   await launchCommand({ name: "import", type: LaunchType.UserInitiated });
+}
+
+async function openHistory() {
+  await launchCommand({ name: "import-history", type: LaunchType.UserInitiated });
+}
+
+async function openSettings() {
+  await launchCommand({ name: "configure", type: LaunchType.UserInitiated });
+}
+
+/** 転送していないとき: 前回の取り込みと、各コマンドへの入り口 */
+function IdleMenu() {
+  const { data: history, isLoading } = usePromise(() => readHistory(logDirPath()));
+  const last = history?.[0];
+  const lastRun = last?.kind === "run" ? last.summary : undefined;
+  const lastOutcome = lastRun ? outcomeOf(lastRun) : undefined;
+  const lastProjects = lastRun ? projectDirsOf(lastRun) : [];
+
+  return (
+    <MenuBarExtra icon={Icon.Video} tooltip="Vlog Import: 転送していません" isLoading={isLoading}>
+      <MenuBarExtra.Section title="転送していません">
+        <MenuBarExtra.Item
+          title="素材を取り込む…"
+          icon={Icon.Download}
+          shortcut={Keyboard.Shortcut.Common.Open}
+          onAction={openImport}
+        />
+      </MenuBarExtra.Section>
+      {last && (
+        <MenuBarExtra.Section title="前回の取り込み">
+          <MenuBarExtra.Item
+            title={lastProjects.length > 0 ? lastProjects.map((p) => path.basename(p)).join(", ") : "詳細なし"}
+            subtitle={`${new Date(last.startedAt).toLocaleDateString("ja-JP")}${lastOutcome ? ` · ${OUTCOME[lastOutcome].label}` : ""}`}
+            icon={
+              lastOutcome ? { source: OUTCOME[lastOutcome].icon, tintColor: OUTCOME[lastOutcome].color } : Icon.Document
+            }
+            tooltip={lastRun ? `${lastRun.doneFiles} ファイル · ${formatGib(lastRun.doneBytes)}` : undefined}
+            onAction={lastProjects.length === 1 ? () => void open(lastProjects[0]) : openHistory}
+          />
+        </MenuBarExtra.Section>
+      )}
+      <MenuBarExtra.Section>
+        <MenuBarExtra.Item title="取り込み履歴" icon={Icon.Clock} onAction={openHistory} />
+        <MenuBarExtra.Item title="設定…" icon={Icon.Gear} onAction={openSettings} />
+      </MenuBarExtra.Section>
+    </MenuBarExtra>
+  );
 }
 
 export default function Command() {
@@ -31,7 +79,7 @@ export default function Command() {
   const { data: status, isLoading, revalidate } = usePromise(() => readJob(paths));
 
   if (isLoading && !status) return <MenuBarExtra isLoading />;
-  if (!status || status.kind === "none") return null;
+  if (!status || status.kind === "none") return <IdleMenu />;
 
   if (status.kind === "starting") {
     return (
@@ -150,7 +198,7 @@ export default function Command() {
         ) : (
           <MenuBarExtra.Item
             title="結果を閉じる"
-            subtitle="メニューバーから消えます"
+            subtitle="待機表示に戻ります"
             icon={Icon.XMarkCircle}
             onAction={async () => {
               if (await clearJob(paths)) {

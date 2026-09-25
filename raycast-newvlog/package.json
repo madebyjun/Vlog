@@ -25,7 +25,7 @@
       "name": "transfer-status",
       "title": "Vlog Transfer Status",
       "subtitle": "New Vlog",
-      "description": "バックグラウンド転送の進捗・速度・残り時間をメニューバーに表示します (転送中と結果未確認のときだけ表示)",
+      "description": "バックグラウンド転送の進捗・速度・残り時間をメニューバーに表示します (転送していないときは前回の取り込みと各コマンドへの入り口)",
       "mode": "menu-bar",
       "interval": "10s"
     },
