@@ -76,13 +76,16 @@
     "@raycast/eslint-config": "^2.2.0",
     "@types/node": "22.19.17",
     "@types/react": "19.0.10",
+    "esbuild": "^0.28.2",
     "eslint": "^9.22.0",
     "prettier": "^3.5.3",
     "typescript": "^5.8.2"
   },
   "scripts": {
-    "build": "ray build -e dist",
-    "dev": "ray develop",
+    "build:worker": "esbuild src/worker.ts --bundle --platform=node --target=node22 --external:@raycast/api --outfile=assets/worker.js --log-level=warning",
+    "build": "npm run build:worker && ray build -e dist",
+    "dev": "npm run build:worker && ray develop",
+    "e2e": "npm run build:worker && esbuild e2e/run.ts --bundle --platform=node --target=node22 --outfile=e2e/.out/run.js --log-level=warning && node e2e/.out/run.js",
     "lint": "ray lint",
     "fix-lint": "ray lint --fix"
   }

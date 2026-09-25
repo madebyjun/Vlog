@@ -2,3 +2,5 @@ node_modules/
 dist/
 raycast-env.d.ts
 .DS_Store
+assets/worker.js
+e2e/.out/

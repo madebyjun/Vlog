@@ -1,14 +1,14 @@
 // 転送エンジン: newvlog.sh の「フォルダ準備フェーズ」「転送フェーズ」に相当。
-// UI とは独立したシングルトンとして動作し、購読者に進捗を通知する。
-// (Esc で画面を戻っても転送は継続し、再表示時に同じ進捗へ再接続できる)
+// UI とは独立して動作し、購読者に進捗を通知する。
+// 実際には Raycast から切り離したワーカープロセス (worker.ts) の中で動く。
 
 import { ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { formatGib } from "./format";
-import { Plan } from "./plan";
-import { DateGroup, DetectedDevice } from "./scan";
-import { Settings } from "./settings";
+import type { Plan } from "./plan";
+import type { DateGroup, DetectedDevice } from "./scan";
+import type { Settings } from "./settings";
 import { SsdContext, getFreeBytes, isDirectory } from "./ssd";
 import { run } from "./shell";
 
@@ -88,6 +88,32 @@ export interface RunInput {
 }
 
 class AbortError extends Error {}
+
+/**
+ * デバイス単位の容量チェック。問題なければ null。
+ * (ワーカーでの実チェックと、開始前に UI で行う見積もりの両方で使う)
+ */
+export function computeSpaceInfo(
+  deviceName: string,
+  deviceGroups: DateGroup[],
+  marginBytes: number,
+  freeBytes: number,
+): SpaceInfo | null {
+  const totalBytes = deviceGroups.reduce((s, g) => s + g.totalBytes, 0);
+  const fileCount = deviceGroups.reduce((s, g) => s + g.files.length, 0);
+  const requiredBytes = totalBytes + marginBytes;
+  if (requiredBytes <= freeBytes) return null;
+  return {
+    deviceName,
+    totalBytes,
+    fileCount,
+    marginBytes,
+    requiredBytes,
+    freeBytes,
+    shortageBytes: requiredBytes - freeBytes,
+    insufficient: totalBytes > freeBytes,
+  };
+}
 
 const RSYNC = "/usr/bin/rsync";
 const CP = "/bin/cp";
@@ -170,8 +196,9 @@ export class TransferRun {
     };
   }
 
-  start(): void {
-    void this.execute();
+  /** 転送を開始する。返り値は全処理 (中止・異常終了を含む) の完了 */
+  start(): Promise<void> {
+    return this.execute();
   }
 
   /** 中止を要求する。転送中のファイルは停止され、履歴には記録されない */
@@ -288,36 +315,23 @@ export class TransferRun {
 
   private async checkSpace(device: DetectedDevice, deviceGroups: DateGroup[]): Promise<void> {
     const { ctx, settings } = this.input;
-    const totalBytes = deviceGroups.reduce((s, g) => s + g.totalBytes, 0);
-    const fileCount = deviceGroups.reduce((s, g) => s + g.files.length, 0);
-    const marginBytes = settings.spaceMarginBytes;
-    const requiredBytes = totalBytes + marginBytes;
     const freeBytes = await getFreeBytes(ctx.mount);
+    const info = computeSpaceInfo(device.name, deviceGroups, settings.spaceMarginBytes, freeBytes);
+    if (!info) return;
 
-    if (requiredBytes <= freeBytes) return;
-
-    const insufficient = totalBytes > freeBytes;
-    const shortageBytes = requiredBytes - freeBytes;
     this.log(
-      insufficient ? "⚠️  SSDの空き容量が不足しています" : "⚠️  転送は可能な見込みですが、安全マージンを確保できません",
+      info.insufficient
+        ? "⚠️  SSDの空き容量が不足しています"
+        : "⚠️  転送は可能な見込みですが、安全マージンを確保できません",
     );
-    this.log(`    転送予定:       ${formatGib(totalBytes)} (${fileCount}ファイル)`);
-    this.log(`    安全マージン:    ${formatGib(marginBytes)}`);
-    this.log(`    必要空き容量:   ${formatGib(requiredBytes)}`);
-    this.log(`    現在の空き容量: ${formatGib(freeBytes)}`);
-    this.log(`    追加で必要:     ${formatGib(shortageBytes)}`);
+    this.log(`    転送予定:       ${formatGib(info.totalBytes)} (${info.fileCount}ファイル)`);
+    this.log(`    安全マージン:    ${formatGib(info.marginBytes)}`);
+    this.log(`    必要空き容量:   ${formatGib(info.requiredBytes)}`);
+    this.log(`    現在の空き容量: ${formatGib(info.freeBytes)}`);
+    this.log(`    追加で必要:     ${formatGib(info.shortageBytes)}`);
     this.emit();
 
-    const proceed = await this.hooks.confirmSpace({
-      deviceName: device.name,
-      totalBytes,
-      fileCount,
-      marginBytes,
-      requiredBytes,
-      freeBytes,
-      shortageBytes,
-      insufficient,
-    });
+    const proceed = await this.hooks.confirmSpace(info);
     if (!proceed) {
       throw new AbortError("🛑 中止しました。空き容量を確保してから再実行してください。");
     }
@@ -586,28 +600,4 @@ export class TransferRun {
       // ログ保存の失敗は転送結果に影響しない
     }
   }
-}
-
-// ---------- シングルトン管理 ----------
-
-let currentRun: TransferRun | null = null;
-
-export function getCurrentRun(): TransferRun | null {
-  return currentRun;
-}
-
-export function startRun(input: RunInput, hooks: RunHooks): TransferRun {
-  if (currentRun && currentRun.phase === "running") {
-    throw new Error("転送がすでに実行中です。");
-  }
-  currentRun = new TransferRun(input, hooks);
-  currentRun.start();
-  return currentRun;
-}
-
-/** 実行中でなければ現在の転送結果を破棄する */
-export function clearRun(): boolean {
-  if (currentRun && currentRun.phase === "running") return false;
-  currentRun = null;
-  return true;
 }

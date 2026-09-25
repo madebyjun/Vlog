@@ -14,8 +14,11 @@ import {
 } from "@raycast/api";
 import path from "node:path";
 import { ReactNode, useMemo, useState } from "react";
-import { SpaceInfo, startRun } from "../lib/engine";
+import { SpaceInfo, computeSpaceInfo } from "../lib/engine";
 import { formatGib } from "../lib/format";
+import { startJob } from "../lib/job";
+import { nodeBinaryPath, raycastJobPaths, workerScriptPath } from "../lib/runtime";
+import { getFreeBytes } from "../lib/ssd";
 import { Plan, describePlan } from "../lib/plan";
 import { DateGroup } from "../lib/scan";
 import { NewProjectForm } from "./NewProjectForm";
@@ -111,25 +114,35 @@ export function PlanView({ data, onRescan }: Props) {
     const ok = await confirmAlert({
       icon: Icon.Upload,
       title: "転送を開始しますか？",
-      message: `${summary.plannedFiles}ファイル / ${formatGib(summary.plannedBytes)} を転送します。\n転送中は Raycast ウィンドウを閉じないでください。`,
+      message: `${summary.plannedFiles}ファイル / ${formatGib(summary.plannedBytes)} を転送します。\n転送はバックグラウンドで行われるので、Raycast を閉じても大丈夫です。`,
       primaryAction: { title: "転送を開始" },
       dismissAction: { title: "キャンセル" },
     });
     if (!ok) return;
 
     try {
-      const run = startRun(
-        {
-          ctx: data.ctx,
-          settings: data.settings,
-          devices: data.devices,
-          groups: data.groups,
-          plans,
-          logDir: path.join(environment.supportPath, "logs"),
+      const approvedSpaceDevices = await confirmSpaceUpfront();
+      if (!approvedSpaceDevices) return;
+
+      const paths = raycastJobPaths();
+      await startJob({
+        paths,
+        workerScript: workerScriptPath(),
+        nodePath: nodeBinaryPath(),
+        spec: {
+          input: {
+            ctx: data.ctx,
+            settings: data.settings,
+            devices: data.devices,
+            groups: data.groups,
+            plans,
+            logDir: path.join(environment.supportPath, "logs"),
+          },
+          approvedSpaceDevices,
+          notify: true,
         },
-        { confirmSpace },
-      );
-      push(<TransferView run={run} onRestart={onRescan} />);
+      });
+      push(<TransferView paths={paths} onRestart={onRescan} />);
     } catch (error) {
       await showToast({
         style: Toast.Style.Failure,
@@ -137,6 +150,27 @@ export function PlanView({ data, onRescan }: Props) {
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  };
+
+  /**
+   * 転送中は確認ダイアログを出せないため、容量チェックを開始前に見積もりで行う。
+   * 前のデバイスの転送で空きが減る分も織り込む。承認したデバイス名を返し、中止なら null。
+   */
+  const confirmSpaceUpfront = async (): Promise<string[] | null> => {
+    let freeBytes = await getFreeBytes(data.ctx.mount);
+    const approved: string[] = [];
+    for (const device of data.devices) {
+      const deviceGroups = data.groups.filter((g) => g.device.name === device.name);
+      if (deviceGroups.length === 0) continue;
+      const info = computeSpaceInfo(device.name, deviceGroups, data.settings.spaceMarginBytes, freeBytes);
+      if (info) {
+        if (!(await confirmSpace(info))) return null;
+        approved.push(device.name);
+      }
+      const transferring = deviceGroups.filter((g) => plans[g.id] && plans[g.id].kind !== "skip");
+      freeBytes -= transferring.reduce((s, g) => s + g.totalBytes, 0);
+    }
+    return approved;
   };
 
   const spaceWarning = summary.required > data.freeBytes;
@@ -187,7 +221,7 @@ export function PlanView({ data, onRescan }: Props) {
                 "2. すべての日付が決まったら `⌘↩` で転送を開始",
                 "",
                 spaceWarning
-                  ? "> 転送予定 + 安全マージンが空き容量を超えています。転送開始時にデバイスごとに確認します。"
+                  ? "> 転送予定 + 安全マージンが空き容量を超えています。転送開始前にデバイスごとに確認します。"
                   : "",
               ].join("\n")}
               metadata={
