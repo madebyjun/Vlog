@@ -4,33 +4,45 @@ import {
   Alert,
   Color,
   Icon,
-  List,
-  confirmAlert,
-  environment,
-  showToast,
-  Toast,
-  useNavigation,
+  Image,
   Keyboard,
+  List,
+  Toast,
+  confirmAlert,
+  popToRoot,
+  showToast,
 } from "@raycast/api";
 import path from "node:path";
 import { ReactNode, useMemo, useState } from "react";
+import { TIER_LABELS } from "../lib/config";
 import { SpaceInfo, computeSpaceInfo } from "../lib/engine";
 import { formatGib } from "../lib/format";
 import { startJob } from "../lib/job";
-import { nodeBinaryPath, raycastJobPaths, workerScriptPath } from "../lib/runtime";
-import { getFreeBytes } from "../lib/ssd";
-import { Plan, describePlan } from "../lib/plan";
+import { Plan, describePlan, suggestPlan } from "../lib/plan";
+import { logDirPath, nodeBinaryPath, raycastJobPaths, refreshMenuBar, workerScriptPath } from "../lib/runtime";
 import { DateGroup } from "../lib/scan";
+import { getFreeBytes } from "../lib/ssd";
+import { DestinationPicker } from "./DestinationPicker";
 import { NewProjectForm } from "./NewProjectForm";
 import { ScanData } from "./ScanView";
-import { TransferView } from "./TransferView";
+import { SettingsForm } from "./SettingsForm";
 
 interface Props {
   data: ScanData;
   onRescan: () => void;
+  /** 転送ジョブを起動した (ルートを進捗画面に切り替える) */
+  onStarted: () => void;
 }
 
-function planIcon(plan: Plan | undefined): List.Item.Props["icon"] {
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+
+function withWeekday(date: string): string {
+  const [y, m, d] = date.split("-").map(Number);
+  const day = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return Number.isNaN(day) ? date : `${date} (${WEEKDAYS[day]})`;
+}
+
+function planIcon(plan: Plan | undefined): Image.ImageLike {
   if (!plan) return { source: Icon.QuestionMarkCircle, tintColor: Color.Orange };
   switch (plan.kind) {
     case "existing":
@@ -38,7 +50,7 @@ function planIcon(plan: Plan | undefined): List.Item.Props["icon"] {
     case "new":
       return { source: Icon.NewFolder, tintColor: Color.Green };
     case "skip":
-      return { source: Icon.Forward, tintColor: Color.SecondaryText };
+      return { source: Icon.MinusCircle, tintColor: Color.SecondaryText };
   }
 }
 
@@ -48,35 +60,46 @@ function planTag(plan: Plan | undefined): { value: string; color: Color } {
     case "existing":
       return { value: "既存", color: Color.Blue };
     case "new":
-      return { value: `新規 · ${plan.tier}`, color: Color.Green };
+      return { value: `新規 · ${TIER_LABELS[plan.tier]}`, color: Color.Green };
     case "skip":
       return { value: "スキップ", color: Color.SecondaryText };
   }
 }
 
-/** 容量不足時の確認ダイアログ (スクリプトの [1]中止 / [2]このまま転送 に相当) */
-async function confirmSpace(info: SpaceInfo): Promise<boolean> {
-  const lines = [
-    `転送予定: ${formatGib(info.totalBytes)} (${info.fileCount}ファイル)`,
-    `安全マージン: ${formatGib(info.marginBytes)}`,
-    `必要空き容量: ${formatGib(info.requiredBytes)}`,
-    `現在の空き容量: ${formatGib(info.freeBytes)}`,
-    `追加で必要: ${formatGib(info.shortageBytes)}`,
-  ];
-  return confirmAlert({
-    icon: { source: Icon.Warning, tintColor: Color.Orange },
-    title: info.insufficient
-      ? `[${info.deviceName}] SSDの空き容量が不足しています`
-      : `[${info.deviceName}] 安全マージンを確保できません`,
-    message: lines.join("\n"),
-    primaryAction: { title: "このまま転送を開始する (入るところまで)", style: Alert.ActionStyle.Destructive },
-    dismissAction: { title: "中止する" },
-  });
+function isTransferring(plan: Plan | undefined): boolean {
+  return plan !== undefined && plan.kind !== "skip";
 }
 
-export function PlanView({ data, onRescan }: Props) {
-  const { push } = useNavigation();
-  const [plans, setPlans] = useState<Record<string, Plan>>({});
+/**
+ * 転送中は確認ダイアログを出せないため、容量チェックを開始前に見積もりで行う。
+ * 前のデバイスの転送で空きが減る分も織り込む。
+ */
+async function estimateSpace(data: ScanData, plans: Record<string, Plan>): Promise<SpaceInfo[]> {
+  let freeBytes = await getFreeBytes(data.ctx.mount);
+  const issues: SpaceInfo[] = [];
+  for (const device of data.devices) {
+    // エンジンと同じく、スキップする日付は含めない
+    const deviceGroups = data.groups.filter((g) => g.device.name === device.name && isTransferring(plans[g.id]));
+    if (deviceGroups.length === 0) continue;
+    const info = computeSpaceInfo(device.name, deviceGroups, data.settings.spaceMarginBytes, freeBytes);
+    if (info) issues.push(info);
+    freeBytes -= deviceGroups.reduce((s, g) => s + g.totalBytes, 0);
+  }
+  return issues;
+}
+
+export function PlanView({ data, onRescan, onStarted }: Props) {
+  const { settings } = data;
+  const suggestions = useMemo(() => {
+    const result: Record<string, Plan> = {};
+    for (const g of data.groups) {
+      const plan = suggestPlan(g, settings);
+      if (plan) result[g.id] = plan;
+    }
+    return result;
+  }, [data, settings]);
+  const [plans, setPlans] = useState<Record<string, Plan>>(suggestions);
+  const [starting, setStarting] = useState(false);
 
   const setPlan = (id: string, plan: Plan | undefined) => {
     setPlans((prev) => {
@@ -88,95 +111,96 @@ export function PlanView({ data, onRescan }: Props) {
   };
 
   const summary = useMemo(() => {
-    const totalFiles = data.groups.reduce((s, g) => s + g.files.length, 0);
-    const totalBytes = data.groups.reduce((s, g) => s + g.totalBytes, 0);
-    const planned = data.groups.filter((g) => plans[g.id] && plans[g.id].kind !== "skip");
-    const plannedBytes = planned.reduce((s, g) => s + g.totalBytes, 0);
-    const plannedFiles = planned.reduce((s, g) => s + g.files.length, 0);
-    const unplanned = data.groups.filter((g) => !plans[g.id]).length;
-    const required = totalBytes + data.settings.spaceMarginBytes;
-    return { totalFiles, totalBytes, plannedBytes, plannedFiles, unplanned, required };
+    const planned = data.groups.filter((g) => isTransferring(plans[g.id]));
+    return {
+      plannedFiles: planned.reduce((s, g) => s + g.files.length, 0),
+      plannedBytes: planned.reduce((s, g) => s + g.totalBytes, 0),
+      plannedDays: planned.length,
+      unplanned: data.groups.filter((g) => !plans[g.id]).length,
+    };
   }, [data, plans]);
 
+  const requiredBytes = summary.plannedBytes + settings.spaceMarginBytes;
+  const spaceShort = requiredBytes > data.freeBytes;
+
   const startTransfer = async () => {
+    if (starting) return;
     if (summary.unplanned > 0) {
       await showToast({
         style: Toast.Style.Failure,
-        title: `未決定の日付が ${summary.unplanned} 件あります`,
-        message: "各日付で「既存を使用」「新規作成」「スキップ」のいずれかを選んでください",
+        title: `転送先が決まっていない日付が ${summary.unplanned} 件あります`,
       });
       return;
     }
     if (summary.plannedFiles === 0) {
-      await showToast({ style: Toast.Style.Failure, title: "転送対象がありません (すべてスキップ)" });
+      await showToast({ style: Toast.Style.Failure, title: "転送するファイルがありません" });
       return;
     }
-    const ok = await confirmAlert({
-      icon: Icon.Upload,
-      title: "転送を開始しますか？",
-      message: `${summary.plannedFiles}ファイル / ${formatGib(summary.plannedBytes)} を転送します。\n転送はバックグラウンドで行われるので、Raycast を閉じても大丈夫です。`,
-      primaryAction: { title: "転送を開始" },
-      dismissAction: { title: "キャンセル" },
-    });
-    if (!ok) return;
 
+    setStarting(true);
     try {
-      const approvedSpaceDevices = await confirmSpaceUpfront();
-      if (!approvedSpaceDevices) return;
+      const issues = await estimateSpace(data, plans);
+      const base = `${summary.plannedFiles}ファイル (${formatGib(summary.plannedBytes)}) を転送します。Raycast を閉じても転送は続きます。`;
+      const ok = await confirmAlert(
+        issues.length === 0
+          ? {
+              icon: Icon.Upload,
+              title: "転送を開始しますか？",
+              message: base,
+              primaryAction: { title: "転送を開始" },
+              dismissAction: { title: "キャンセル" },
+            }
+          : {
+              icon: { source: Icon.Warning, tintColor: Color.Orange },
+              title: issues.some((i) => i.insufficient) ? "SSDの空き容量が足りません" : "安全マージンを確保できません",
+              message: [
+                base,
+                "",
+                ...issues.map(
+                  (i) =>
+                    `${i.deviceName}: 必要 ${formatGib(i.requiredBytes)} / 空き ${formatGib(i.freeBytes)} (不足 ${formatGib(i.shortageBytes)})`,
+                ),
+                "",
+                "続けると、入るところまで転送します。",
+              ].join("\n"),
+              primaryAction: { title: "このまま転送", style: Alert.ActionStyle.Destructive },
+              dismissAction: { title: "キャンセル" },
+            },
+      );
+      if (!ok) return;
 
-      const paths = raycastJobPaths();
       await startJob({
-        paths,
+        paths: raycastJobPaths(),
         workerScript: workerScriptPath(),
         nodePath: nodeBinaryPath(),
         spec: {
           input: {
             ctx: data.ctx,
-            settings: data.settings,
+            settings,
             devices: data.devices,
             groups: data.groups,
             plans,
-            logDir: path.join(environment.supportPath, "logs"),
+            logDir: logDirPath(),
           },
-          approvedSpaceDevices,
-          notify: true,
+          approvedSpaceDevices: issues.map((i) => i.deviceName),
+          notify: settings.notify,
         },
       });
-      push(<TransferView paths={paths} onRestart={onRescan} />);
+      await refreshMenuBar();
+      onStarted();
     } catch (error) {
       await showToast({
         style: Toast.Style.Failure,
         title: "転送を開始できません",
         message: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      setStarting(false);
     }
   };
-
-  /**
-   * 転送中は確認ダイアログを出せないため、容量チェックを開始前に見積もりで行う。
-   * 前のデバイスの転送で空きが減る分も織り込む。承認したデバイス名を返し、中止なら null。
-   */
-  const confirmSpaceUpfront = async (): Promise<string[] | null> => {
-    let freeBytes = await getFreeBytes(data.ctx.mount);
-    const approved: string[] = [];
-    for (const device of data.devices) {
-      const deviceGroups = data.groups.filter((g) => g.device.name === device.name);
-      if (deviceGroups.length === 0) continue;
-      const info = computeSpaceInfo(device.name, deviceGroups, data.settings.spaceMarginBytes, freeBytes);
-      if (info) {
-        if (!(await confirmSpace(info))) return null;
-        approved.push(device.name);
-      }
-      const transferring = deviceGroups.filter((g) => plans[g.id] && plans[g.id].kind !== "skip");
-      freeBytes -= transferring.reduce((s, g) => s + g.totalBytes, 0);
-    }
-    return approved;
-  };
-
-  const spaceWarning = summary.required > data.freeBytes;
 
   const commonActions = (
-    <ActionPanel.Section title="全体">
+    <ActionPanel.Section>
       <Action
         title="転送を開始"
         icon={Icon.Upload}
@@ -189,66 +213,79 @@ export function PlanView({ data, onRescan }: Props) {
         shortcut={Keyboard.Shortcut.Common.Refresh}
         onAction={onRescan}
       />
+      <Action.Push
+        title="設定"
+        icon={Icon.Gear}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "," }}
+        target={
+          <SettingsForm
+            onSaved={() => {
+              void popToRoot();
+              onRescan();
+            }}
+          />
+        }
+      />
     </ActionPanel.Section>
   );
 
+  const ssdName = path.basename(data.ctx.mount);
+
   return (
-    <List isShowingDetail navigationTitle="転送プラン" searchBarPlaceholder="日付・デバイスで絞り込み">
-      <List.Section title="概要">
+    <List
+      isShowingDetail
+      isLoading={starting}
+      navigationTitle="転送プラン"
+      searchBarPlaceholder="日付・デバイスで絞り込み"
+    >
+      <List.Section title="転送">
         <List.Item
-          title="転送サマリ"
+          title="転送を開始"
+          subtitle={`${summary.plannedDays}日分 · ${summary.plannedFiles}ファイル · ${formatGib(summary.plannedBytes)}`}
           icon={{
-            source: spaceWarning ? Icon.Warning : Icon.HardDrive,
-            tintColor: spaceWarning ? Color.Orange : Color.Blue,
+            source: spaceShort ? Icon.Warning : Icon.Upload,
+            tintColor: spaceShort ? Color.Orange : summary.unplanned > 0 ? Color.SecondaryText : Color.Blue,
           }}
+          keywords={["start", "transfer"]}
           accessories={[
-            {
-              tag: { value: `未決定 ${summary.unplanned}`, color: summary.unplanned > 0 ? Color.Orange : Color.Green },
-            },
+            ...(summary.unplanned > 0 ? [{ tag: { value: `未決定 ${summary.unplanned}`, color: Color.Orange } }] : []),
+            ...(spaceShort ? [{ tag: { value: "容量不足", color: Color.Orange } }] : []),
           ]}
           detail={
             <List.Item.Detail
-              markdown={[
-                `## ${spaceWarning ? "⚠️ 空き容量に注意" : "✅ SSD準備完了"}`,
-                "",
-                `履歴: ${data.ctx.historyCount}件`,
-                "",
-                "### 🔎 検出されたデバイス",
-                ...data.devices.map((d) => `- ✅ **${d.name}**  \`${d.sourceDir}\``),
-                "",
-                "### 📋 使い方",
-                "1. 各日付を選び、`⌘K` から「既存プロジェクトを使用」「新規プロジェクトを作成」「スキップ」を選択",
-                "2. すべての日付が決まったら `⌘↩` で転送を開始",
-                "",
-                spaceWarning
-                  ? "> 転送予定 + 安全マージンが空き容量を超えています。転送開始前にデバイスごとに確認します。"
-                  : "",
-              ].join("\n")}
               metadata={
                 <List.Item.Detail.Metadata>
-                  <List.Item.Detail.Metadata.Label title="SSD" text={data.ctx.mount} />
-                  <List.Item.Detail.Metadata.Label title="保存先" text={data.ctx.footageRoot} />
+                  <List.Item.Detail.Metadata.Label title="転送する日付" text={`${summary.plannedDays} 日分`} />
+                  <List.Item.Detail.Metadata.Label title="ファイル" text={`${summary.plannedFiles}`} />
+                  <List.Item.Detail.Metadata.Label title="サイズ" text={formatGib(summary.plannedBytes)} />
+                  {summary.unplanned > 0 && (
+                    <List.Item.Detail.Metadata.Label
+                      title="未決定"
+                      text={`${summary.unplanned} 件 — 日付を選んで Enter で転送先を決めてください`}
+                      icon={{ source: Icon.QuestionMarkCircle, tintColor: Color.Orange }}
+                    />
+                  )}
                   <List.Item.Detail.Metadata.Separator />
+                  <List.Item.Detail.Metadata.Label title="保存先SSD" text={ssdName} icon={Icon.HardDrive} />
                   <List.Item.Detail.Metadata.Label
-                    title="転送対象 (全体)"
-                    text={`${summary.totalFiles}ファイル / ${formatGib(summary.totalBytes)}`}
-                  />
-                  <List.Item.Detail.Metadata.Label
-                    title="転送対象 (プラン済み)"
-                    text={`${summary.plannedFiles}ファイル / ${formatGib(summary.plannedBytes)}`}
-                  />
-                  <List.Item.Detail.Metadata.Label
-                    title="安全マージン"
-                    text={formatGib(data.settings.spaceMarginBytes)}
-                  />
-                  <List.Item.Detail.Metadata.Label title="必要空き容量" text={formatGib(summary.required)} />
-                  <List.Item.Detail.Metadata.Label
-                    title="現在の空き容量"
+                    title="空き容量"
                     text={formatGib(data.freeBytes)}
-                    icon={spaceWarning ? { source: Icon.Warning, tintColor: Color.Orange } : undefined}
+                    icon={spaceShort ? { source: Icon.Warning, tintColor: Color.Orange } : undefined}
+                  />
+                  <List.Item.Detail.Metadata.Label
+                    title="必要な空き容量"
+                    text={`${formatGib(requiredBytes)} (マージン ${formatGib(settings.spaceMarginBytes)} を含む)`}
                   />
                   <List.Item.Detail.Metadata.Separator />
-                  <List.Item.Detail.Metadata.Label title="日付切り替え時刻" text={data.settings.cutoffTime} />
+                  <List.Item.Detail.Metadata.TagList title="デバイス">
+                    {data.devices.map((d) => (
+                      <List.Item.Detail.Metadata.TagList.Item key={d.name} text={d.name} />
+                    ))}
+                  </List.Item.Detail.Metadata.TagList>
+                  <List.Item.Detail.Metadata.Label
+                    title="日付の切り替え"
+                    text={`${settings.cutoffTime} より前は前日扱い`}
+                  />
                 </List.Item.Detail.Metadata>
               }
             />
@@ -259,14 +296,17 @@ export function PlanView({ data, onRescan }: Props) {
 
       {data.devices.map((device) => {
         const groups = data.groups.filter((g) => g.device.name === device.name);
+        if (groups.length === 0) return null;
+        const bytes = groups.reduce((s, g) => s + g.totalBytes, 0);
         return (
-          <List.Section key={device.name} title={device.name} subtitle={device.sourceDir}>
+          <List.Section key={device.name} title={device.name} subtitle={`${groups.length}日 · ${formatGib(bytes)}`}>
             {groups.map((group) => (
               <GroupItem
                 key={group.id}
                 group={group}
                 plan={plans[group.id]}
-                defaultTitle={data.settings.defaultTitle}
+                suggestion={suggestions[group.id]}
+                data={data}
                 onPlanChange={(plan) => setPlan(group.id, plan)}
                 commonActions={commonActions}
               />
@@ -281,58 +321,81 @@ export function PlanView({ data, onRescan }: Props) {
 interface GroupItemProps {
   group: DateGroup;
   plan: Plan | undefined;
-  defaultTitle: string;
+  suggestion: Plan | undefined;
+  data: ScanData;
   onPlanChange: (plan: Plan | undefined) => void;
   commonActions: ReactNode;
 }
 
-function GroupItem({ group, plan, defaultTitle, onPlanChange, commonActions }: GroupItemProps) {
-  const previewLimit = 40;
-  const fileLines = group.files.slice(0, previewLimit).map((f) => `- ${f.name}  _(${formatGib(f.size)})_`);
-  if (group.files.length > previewLimit) fileLines.push(`- … 他 ${group.files.length - previewLimit} ファイル`);
+function fileTypes(group: DateGroup): string {
+  const counts = new Map<string, number>();
+  for (const f of group.files) {
+    const ext = path.extname(f.name).slice(1).toUpperCase() || "?";
+    counts.set(ext, (counts.get(ext) ?? 0) + 1);
+  }
+  return [...counts].map(([ext, n]) => `${ext} ×${n}`).join(" · ");
+}
 
-  const existingLines =
-    group.existing.length > 0
-      ? group.existing.map((p) => `- ${p.tier} / **${p.name}**`)
-      : ["- (なし → 新規作成のみ選択可能)"];
+function destinationText(group: DateGroup, plan: Plan | undefined, footageRoot: string): string {
+  if (!plan) return "—";
+  switch (plan.kind) {
+    case "existing":
+      return path.relative(footageRoot, plan.projectDir);
+    case "new":
+      return `${plan.tier}/${group.date}-${plan.title}`;
+    case "skip":
+      return "転送しない";
+  }
+}
 
+function GroupItem({ group, plan, suggestion, data, onPlanChange, commonActions }: GroupItemProps) {
+  const { settings } = data;
   const tag = planTag(plan);
+  const times = group.files.map((f) => f.time).sort();
+  const isSuggested = plan !== undefined && JSON.stringify(plan) === JSON.stringify(suggestion);
 
   return (
     <List.Item
-      title={group.date}
+      title={withWeekday(group.date)}
       subtitle={`${group.files.length}ファイル · ${formatGib(group.totalBytes)}`}
-      keywords={[group.device.name, group.date.replace(/-/g, "")]}
+      keywords={[group.device.name, group.date.replace(/-/g, ""), ...(plan ? [describePlan(plan)] : [])]}
       icon={planIcon(plan)}
-      accessories={[{ tag }]}
+      accessories={[{ tag, tooltip: describePlan(plan) }]}
       detail={
         <List.Item.Detail
-          markdown={[
-            `## 📅 ${group.date}  —  ${group.device.name}`,
-            "",
-            `**プラン:** ${describePlan(plan)}`,
-            "",
-            "### ⚡️ 既存プロジェクト",
-            ...existingLines,
-            "",
-            `### 📄 転送対象ファイル (${group.files.length})`,
-            ...fileLines,
-          ].join("\n")}
           metadata={
             <List.Item.Detail.Metadata>
-              <List.Item.Detail.Metadata.Label title="デバイス" text={group.device.name} />
-              <List.Item.Detail.Metadata.Label title="転送先サブフォルダ" text={group.device.destFolderName} />
-              <List.Item.Detail.Metadata.Label title="ファイル数" text={String(group.files.length)} />
-              <List.Item.Detail.Metadata.Label title="サイズ" text={formatGib(group.totalBytes)} />
-              <List.Item.Detail.Metadata.Separator />
-              <List.Item.Detail.Metadata.TagList title="プラン">
+              <List.Item.Detail.Metadata.TagList title="転送先">
                 <List.Item.Detail.Metadata.TagList.Item text={tag.value} color={tag.color} />
+                {isSuggested && <List.Item.Detail.Metadata.TagList.Item text="自動で選択" />}
               </List.Item.Detail.Metadata.TagList>
-              {plan?.kind === "existing" && (
-                <List.Item.Detail.Metadata.Label title="プロジェクト" text={plan.projectDir} />
+              <List.Item.Detail.Metadata.Label
+                title="プロジェクト"
+                text={destinationText(group, plan, data.ctx.footageRoot)}
+              />
+              {plan && plan.kind !== "skip" && (
+                <List.Item.Detail.Metadata.Label title="サブフォルダ" text={group.device.destFolderName} />
               )}
-              {plan?.kind === "new" && (
-                <List.Item.Detail.Metadata.Label title="作成先" text={`${plan.tier}/${group.date}-${plan.title}`} />
+              <List.Item.Detail.Metadata.Separator />
+              <List.Item.Detail.Metadata.Label title="デバイス" text={group.device.name} />
+              <List.Item.Detail.Metadata.Label title="ファイル" text={`${group.files.length} (${fileTypes(group)})`} />
+              <List.Item.Detail.Metadata.Label title="サイズ" text={formatGib(group.totalBytes)} />
+              {times.length > 0 && (
+                <List.Item.Detail.Metadata.Label title="撮影時刻" text={`${times[0]} – ${times[times.length - 1]}`} />
+              )}
+              <List.Item.Detail.Metadata.Separator />
+              {group.existing.length === 0 ? (
+                <List.Item.Detail.Metadata.Label title="既存のプロジェクト" text="なし" />
+              ) : (
+                <List.Item.Detail.Metadata.TagList title="既存のプロジェクト">
+                  {group.existing.map((p) => (
+                    <List.Item.Detail.Metadata.TagList.Item
+                      key={p.path}
+                      text={`${TIER_LABELS[p.tier]} / ${p.name}`}
+                      color={plan?.kind === "existing" && plan.projectDir === p.path ? Color.Blue : undefined}
+                    />
+                  ))}
+                </List.Item.Detail.Metadata.TagList>
               )}
             </List.Item.Detail.Metadata>
           }
@@ -340,44 +403,48 @@ function GroupItem({ group, plan, defaultTitle, onPlanChange, commonActions }: G
       }
       actions={
         <ActionPanel>
-          <ActionPanel.Section title={`${group.date} のプラン`}>
-            {group.existing.length > 0 && (
-              <ActionPanel.Submenu title="既存プロジェクトを使用" icon={Icon.Folder}>
-                {group.existing.map((p) => (
-                  <Action
-                    key={p.path}
-                    title={`${p.tier} / ${p.name}`}
-                    icon={Icon.Folder}
-                    onAction={() => onPlanChange({ kind: "existing", projectDir: p.path, projectName: p.name })}
-                  />
-                ))}
-              </ActionPanel.Submenu>
-            )}
+          <ActionPanel.Section title={group.date}>
             <Action.Push
-              title="新規プロジェクトを作成"
+              title="転送先を選択…"
+              icon={Icon.Folder}
+              target={
+                <DestinationPicker
+                  group={group}
+                  plan={plan}
+                  defaultTitle={settings.defaultTitle}
+                  defaultTier={settings.defaultTier}
+                  onChange={onPlanChange}
+                />
+              }
+            />
+            <Action.Push
+              title="新規プロジェクトを作成…"
               icon={Icon.NewFolder}
               shortcut={Keyboard.Shortcut.Common.New}
               target={
                 <NewProjectForm
                   group={group}
-                  defaultTitle={defaultTitle}
+                  defaultTitle={settings.defaultTitle}
+                  defaultTier={settings.defaultTier}
                   initial={plan?.kind === "new" ? { title: plan.title, tier: plan.tier } : undefined}
                   onSubmit={onPlanChange}
                 />
               }
             />
-            <Action
-              title="この日付をスキップ"
-              icon={Icon.Forward}
-              shortcut={Keyboard.Shortcut.Common.Save}
-              onAction={() => onPlanChange({ kind: "skip" })}
-            />
-            {plan && (
+            {plan?.kind !== "skip" && (
               <Action
-                title="未決定に戻す"
+                title="スキップ"
+                icon={Icon.MinusCircle}
+                shortcut={Keyboard.Shortcut.Common.Remove}
+                onAction={() => onPlanChange({ kind: "skip" })}
+              />
+            )}
+            {!isSuggested && (
+              <Action
+                title={suggestion ? "自動の選択に戻す" : "未決定に戻す"}
                 icon={Icon.Undo}
-                shortcut={{ modifiers: ["cmd"], key: "backspace" }}
-                onAction={() => onPlanChange(undefined)}
+                shortcut={{ modifiers: ["cmd"], key: "z" }}
+                onAction={() => onPlanChange(suggestion)}
               />
             )}
           </ActionPanel.Section>

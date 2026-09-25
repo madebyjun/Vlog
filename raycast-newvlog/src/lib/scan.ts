@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { DEVICE_RULES, DeviceRule, EXCLUDE_PATTERNS, TIER_FOLDERS, Tier } from "./config";
+import { DEVICE_RULES, DeviceRule, TIER_FOLDERS, Tier } from "./config";
 import { calculateShootingDate } from "./date";
 import { globToRegExp } from "./format";
 import { Settings } from "./settings";
@@ -21,6 +21,8 @@ export interface ScannedFile {
   size: number;
   /** YYYY-MM-DD (切り替え時刻を考慮した撮影日) */
   date: string;
+  /** ファイル名から読んだ撮影時刻 HH:MM */
+  time: string;
 }
 
 export interface ExistingProject {
@@ -122,7 +124,7 @@ export async function scanDevice(device: DetectedDevice, ctx: SsdContext, settin
     return [];
   }
 
-  const excludes = EXCLUDE_PATTERNS.map(globToRegExp);
+  const excludes = settings.excludePatterns.map(globToRegExp);
   const byDate = new Map<string, ScannedFile[]>();
 
   for (const name of names) {
@@ -153,7 +155,7 @@ export async function scanDevice(device: DetectedDevice, ctx: SsdContext, settin
     if (!date) continue;
 
     const list = byDate.get(date) ?? [];
-    list.push({ path: full, name, size: stat.size, date });
+    list.push({ path: full, name, size: stat.size, date, time: `${tpart.slice(0, 2)}:${tpart.slice(2, 4)}` });
     byDate.set(date, list);
   }
 

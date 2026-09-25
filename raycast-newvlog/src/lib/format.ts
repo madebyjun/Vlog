@@ -3,11 +3,28 @@ export function formatGib(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GiB`;
 }
 
-/** 0〜1 の比率をテキストのプログレスバーにする */
-export function progressBar(ratio: number, width = 24): string {
-  const clamped = Math.max(0, Math.min(1, Number.isFinite(ratio) ? ratio : 0));
-  const filled = Math.round(clamped * width);
-  return `${"█".repeat(filled)}${"░".repeat(width - filled)} ${Math.round(clamped * 100)}%`;
+/** 1 GiB 未満は MiB で表示する */
+export function formatSize(bytes: number): string {
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MiB`;
+  return formatGib(bytes);
+}
+
+/** バイト/秒を「123 MB/s」表記にする */
+export function formatSpeed(bytesPerSec: number): string {
+  const mb = bytesPerSec / 1000 / 1000;
+  return `${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)} MB/s`;
+}
+
+export function formatPercent(ratio: number): string {
+  return `${Math.floor(ratio * 100)}%`;
+}
+
+/** 残り時間を大まかに表す (1分未満は「まもなく」) */
+export function formatEta(ms: number): string {
+  if (ms < 60_000) return "まもなく完了";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `残り約${minutes}分`;
+  return `残り約${Math.floor(minutes / 60)}時間${minutes % 60}分`;
 }
 
 /** 経過ミリ秒を「1分32秒」形式にする */

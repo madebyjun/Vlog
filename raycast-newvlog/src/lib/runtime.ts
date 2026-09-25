@@ -1,12 +1,39 @@
-// Raycast 上での、バックグラウンドジョブの場所と起動方法
-import { environment } from "@raycast/api";
+// Raycast 上での、バックグラウンドジョブ・設定・ログの場所と起動方法
+import { LaunchType, environment, launchCommand } from "@raycast/api";
 import * as fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { JobPaths, jobPaths } from "./job";
+import { LoadedSettings, Settings, loadSettingsFrom, saveSettingsTo, settingsFile } from "./settings";
 
 export function raycastJobPaths(): JobPaths {
   return jobPaths(environment.supportPath);
+}
+
+export function loadRaycastSettings(): LoadedSettings {
+  return loadSettingsFrom(settingsFile(environment.supportPath));
+}
+
+export function saveRaycastSettings(settings: Settings): void {
+  saveSettingsTo(settingsFile(environment.supportPath), settings);
+}
+
+export function raycastSettingsFile(): string {
+  return settingsFile(environment.supportPath);
+}
+
+/** 転送ログと履歴用の要約の保存先 */
+export function logDirPath(): string {
+  return path.join(environment.supportPath, "logs");
+}
+
+/** メニューバーの表示をすぐ更新する (メニューバーコマンドが無効なら何もしない) */
+export async function refreshMenuBar(): Promise<void> {
+  try {
+    await launchCommand({ name: "transfer-status", type: LaunchType.Background });
+  } catch {
+    // メニューバーコマンドを有効にしていない場合など
+  }
 }
 
 export function workerScriptPath(): string {

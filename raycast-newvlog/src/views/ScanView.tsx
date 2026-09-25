@@ -1,9 +1,12 @@
-import { Action, ActionPanel, Detail, Icon, List, openExtensionPreferences } from "@raycast/api";
-import { useCallback, useEffect, useState } from "react";
+import { Action, ActionPanel, Color, Icon, Keyboard, List, launchCommand, LaunchType, popToRoot } from "@raycast/api";
+import path from "node:path";
+import { ReactNode, useCallback, useEffect, useState } from "react";
+import { loadRaycastSettings } from "../lib/runtime";
 import { DateGroup, DetectedDevice, detectDevices, scanDevice } from "../lib/scan";
-import { Settings, loadSettings } from "../lib/settings";
+import { Settings, SettingsErrors } from "../lib/settings";
 import { SsdContext, getFreeBytes, prepareSsd } from "../lib/ssd";
 import { PlanView } from "./PlanView";
+import { SettingsForm } from "./SettingsForm";
 
 export interface ScanData {
   settings: Settings;
@@ -13,11 +16,15 @@ export interface ScanData {
   freeBytes: number;
 }
 
-type ScanState = { status: "loading" } | { status: "error"; message: string } | { status: "ready"; data: ScanData };
+type ScanState =
+  | { status: "loading" }
+  | { status: "setup" }
+  | { status: "invalid"; errors: SettingsErrors }
+  | { status: "error"; message: string }
+  | { status: "ready"; data: ScanData };
 
 /** スクリプトの 1. SSD準備 & 2. デバイス検出・ファイルスキャン に相当 */
-async function performScan(): Promise<ScanData> {
-  const settings = loadSettings();
+async function performScan(settings: Settings): Promise<ScanData> {
   const ctx = await prepareSsd(settings.ssdUuid);
   const devices = await detectDevices(ctx.mount);
   const groups: DateGroup[] = [];
@@ -28,14 +35,22 @@ async function performScan(): Promise<ScanData> {
   return { settings, ctx, devices, groups, freeBytes };
 }
 
-export function ScanView() {
+export function ScanView({ onStarted }: { onStarted: () => void }) {
   const [state, setState] = useState<ScanState>({ status: "loading" });
 
   const rescan = useCallback(async () => {
     setState({ status: "loading" });
+    const loaded = loadRaycastSettings();
+    if (loaded.kind === "missing") {
+      setState({ status: "setup" });
+      return;
+    }
+    if (loaded.kind === "invalid") {
+      setState({ status: "invalid", errors: loaded.errors });
+      return;
+    }
     try {
-      const data = await performScan();
-      setState({ status: "ready", data });
+      setState({ status: "ready", data: await performScan(loaded.settings) });
     } catch (error) {
       setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
     }
@@ -45,60 +60,86 @@ export function ScanView() {
     void rescan();
   }, [rescan]);
 
-  if (state.status === "loading") {
-    return (
-      <List isLoading navigationTitle="New Vlog Import">
-        <List.EmptyView icon={Icon.MagnifyingGlass} title="🔍 SSDとデバイスを確認しています..." />
-      </List>
-    );
+  if (state.status === "setup") {
+    return <SettingsForm onboarding onSaved={() => void rescan()} />;
+  }
+  if (state.status === "ready" && state.data.groups.length > 0) {
+    return <PlanView data={state.data} onRescan={() => void rescan()} onStarted={onStarted} />;
   }
 
-  if (state.status === "error") {
-    return (
-      <Detail
-        navigationTitle="New Vlog Import"
-        markdown={`# ❌ エラー\n\n${state.message}\n\n---\n\nSSD の接続と、拡張機能の設定 (SSD UUID) を確認してから「再スキャン」を実行してください。`}
-        actions={
-          <ActionPanel>
-            <Action title="再スキャン" icon={Icon.ArrowClockwise} onAction={() => void rescan()} />
-            <Action title="拡張機能の設定を開く" icon={Icon.Gear} onAction={() => void openExtensionPreferences()} />
-          </ActionPanel>
+  const actions = (primary?: ReactNode) => (
+    <ActionPanel>
+      {primary}
+      <Action
+        title="再スキャン"
+        icon={Icon.ArrowClockwise}
+        shortcut={Keyboard.Shortcut.Common.Refresh}
+        onAction={() => void rescan()}
+      />
+      <Action.Push
+        title="設定"
+        icon={Icon.Gear}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "," }}
+        target={
+          <SettingsForm
+            onSaved={() => {
+              void popToRoot();
+              void rescan();
+            }}
+          />
         }
+      />
+      <Action
+        title="取り込み履歴"
+        icon={Icon.Clock}
+        shortcut={{ modifiers: ["cmd", "shift"], key: "h" }}
+        onAction={() => void launchCommand({ name: "import-history", type: LaunchType.UserInitiated })}
+      />
+    </ActionPanel>
+  );
+
+  let empty: ReactNode = null;
+  if (state.status === "invalid") {
+    empty = (
+      <List.EmptyView
+        icon={{ source: Icon.Warning, tintColor: Color.Orange }}
+        title="設定に問題があります"
+        description={Object.values(state.errors).join("\n")}
+        actions={actions()}
+      />
+    );
+  } else if (state.status === "error") {
+    empty = (
+      <List.EmptyView
+        icon={{ source: Icon.HardDrive, tintColor: Color.Red }}
+        title={state.message}
+        description="SSD が接続されているか、設定の保存先SSDが正しいか確認してください。"
+        actions={actions()}
+      />
+    );
+  } else if (state.status === "ready" && state.data.devices.length === 0) {
+    empty = (
+      <List.EmptyView
+        icon={Icon.Camera}
+        title="撮影デバイスが接続されていません"
+        description={`Osmo Action または DJI Mic を接続して ⌘R で再スキャンしてください。\n保存先: ${path.basename(state.data.ctx.mount)}`}
+        actions={actions()}
+      />
+    );
+  } else if (state.status === "ready") {
+    empty = (
+      <List.EmptyView
+        icon={{ source: Icon.CheckCircle, tintColor: Color.Green }}
+        title="新しいファイルはありません"
+        description={`${state.data.devices.map((d) => d.name).join("、")} のファイルはすべて取り込み済みです。`}
+        actions={actions()}
       />
     );
   }
 
-  const { data } = state;
-  const header = `✅ SSD準備完了 (履歴: ${data.ctx.historyCount}件)\n\n- マウント: \`${data.ctx.mount}\`\n- 保存先: \`${data.ctx.footageRoot}\``;
-
-  if (data.devices.length === 0) {
-    return (
-      <Detail
-        navigationTitle="New Vlog Import"
-        markdown={`${header}\n\n# 💤 接続されたデバイスが見つかりません。\n\nOsmo Action / DJI Mic を接続してから「再スキャン」を実行してください。`}
-        actions={
-          <ActionPanel>
-            <Action title="再スキャン" icon={Icon.ArrowClockwise} onAction={() => void rescan()} />
-          </ActionPanel>
-        }
-      />
-    );
-  }
-
-  if (data.groups.length === 0) {
-    const deviceList = data.devices.map((d) => `- ✅ ${d.name} (\`${d.sourceDir}\`)`).join("\n");
-    return (
-      <Detail
-        navigationTitle="New Vlog Import"
-        markdown={`${header}\n\n## 🔎 検出されたデバイス\n\n${deviceList}\n\n# 🎉 新しいファイルはありません。`}
-        actions={
-          <ActionPanel>
-            <Action title="再スキャン" icon={Icon.ArrowClockwise} onAction={() => void rescan()} />
-          </ActionPanel>
-        }
-      />
-    );
-  }
-
-  return <PlanView data={data} onRescan={() => void rescan()} />;
+  return (
+    <List isLoading={state.status === "loading"} navigationTitle="Import Vlog Footage">
+      {empty ?? <List.EmptyView icon={Icon.MagnifyingGlass} title="SSDとデバイスを確認しています…" />}
+    </List>
+  );
 }
