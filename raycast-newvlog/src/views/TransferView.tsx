@@ -12,13 +12,59 @@ import {
   Keyboard,
 } from "@raycast/api";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { GroupProgress, RunState, TransferRun, clearRun } from "../lib/engine";
+import type { GroupProgress, RunState } from "../lib/engine";
 import { formatDuration, formatGib, progressBar } from "../lib/format";
+import { JobPaths, JobStatus, cancelJob, clearJob, readJob } from "../lib/job";
 
 interface Props {
-  run: TransferRun;
+  paths: JobPaths;
   /** 結果を破棄して新しいスキャンへ戻る */
   onRestart: () => void;
+}
+
+const POLL_MS = 500;
+const CRASHED_MESSAGE =
+  "転送プロセスが途中で終了しました (強制終了・再起動など)。再実行すれば未転送のファイルだけ転送されます。";
+
+/** バックグラウンドの転送ジョブの状態ファイルを定期的に読む */
+function useJobStatus(paths: JobPaths): JobStatus | undefined {
+  const [status, setStatus] = useState<JobStatus>();
+  useEffect(() => {
+    let active = true;
+    let timer: NodeJS.Timeout | undefined;
+    const poll = async () => {
+      const next = await readJob(paths);
+      if (!active) return;
+      setStatus(next);
+      // 終了後は状態が変わらないので読み直さない
+      if (next.kind === "starting" || next.kind === "running") timer = setTimeout(poll, POLL_MS);
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [paths]);
+  return status;
+}
+
+/** 異常終了したジョブは「中断」として表示する */
+function displayState(status: JobStatus): RunState | undefined {
+  if (status.kind === "running" || status.kind === "finished") return status.state;
+  if (status.kind === "crashed" && status.state) {
+    return {
+      ...status.state,
+      phase: "aborted",
+      fatalError: CRASHED_MESSAGE,
+      finishedAt: status.state.finishedAt ?? Date.now(),
+      groups: status.state.groups.map((g) =>
+        g.status === "transferring" || g.status === "preparing"
+          ? { ...g, status: "failed", currentFile: undefined }
+          : g,
+      ),
+    };
+  }
+  return undefined;
 }
 
 function statusIcon(g: GroupProgress): List.Item.Props["icon"] {
@@ -79,15 +125,40 @@ function phaseTitle(state: RunState): string {
   return state.failed.length > 0 ? "⚠️ 完了 (失敗あり)" : "🎉 全処理完了！";
 }
 
-export function TransferView({ run, onRestart }: Props) {
+export function TransferView({ paths, onRestart }: Props) {
+  const status = useJobStatus(paths);
+  if (!status || status.kind === "starting") {
+    return <List isLoading navigationTitle="転送中..." searchBarPlaceholder="転送を準備しています..." />;
+  }
+  const state = displayState(status);
+  if (!state) {
+    return (
+      <List navigationTitle="転送結果">
+        <List.EmptyView
+          icon={{ source: Icon.XMarkCircle, tintColor: Color.Red }}
+          title="転送の状態を読み込めませんでした"
+          description={status.kind === "crashed" ? CRASHED_MESSAGE : undefined}
+          actions={
+            <ActionPanel>
+              <Action
+                title="新しいスキャンを開始"
+                icon={Icon.ArrowClockwise}
+                onAction={() => void clearJob(paths).then(onRestart)}
+              />
+            </ActionPanel>
+          }
+        />
+      </List>
+    );
+  }
+  return <TransferProgress paths={paths} state={state} onRestart={onRestart} />;
+}
+
+function TransferProgress({ paths, state, onRestart }: Props & { state: RunState }) {
   const { pop } = useNavigation();
-  const [state, setState] = useState<RunState>(() => run.snapshot());
   const [, setTick] = useState(0);
   const toastRef = useRef<Toast | null>(null);
   const lastToastKey = useRef("");
-
-  // エンジンの進捗を購読
-  useEffect(() => run.subscribe(setState), [run]);
 
   // 経過時間表示のための1秒タイマー
   useEffect(() => {
@@ -153,7 +224,7 @@ export function TransferView({ run, onRestart }: Props) {
       lines.push("");
     }
     if (state.phase === "running") {
-      lines.push("> ⚠️ 転送中は Raycast ウィンドウを閉じないでください (Esc で戻っても転送は続きます)。");
+      lines.push("> 💡 転送はバックグラウンドで続きます。Raycast を閉じても大丈夫です (完了すると通知が届きます)。");
       lines.push("");
     }
     if (state.fatalError) {
@@ -182,11 +253,13 @@ export function TransferView({ run, onRestart }: Props) {
       primaryAction: { title: "中止する", style: Alert.ActionStyle.Destructive },
       dismissAction: { title: "続行" },
     });
-    if (ok) run.cancel();
+    if (ok && !(await cancelJob(paths))) {
+      await showToast({ style: Toast.Style.Failure, title: "転送プロセスが見つかりません" });
+    }
   };
 
-  const finishAndRestart = () => {
-    clearRun();
+  const finishAndRestart = async () => {
+    await clearJob(paths);
     toastRef.current?.hide();
     onRestart();
     pop();
@@ -209,7 +282,7 @@ export function TransferView({ run, onRestart }: Props) {
           title="新しいスキャンを開始"
           icon={Icon.ArrowClockwise}
           shortcut={Keyboard.Shortcut.Common.Refresh}
-          onAction={finishAndRestart}
+          onAction={() => void finishAndRestart()}
         />
       )}
       {projectDirs.length > 0 && (
