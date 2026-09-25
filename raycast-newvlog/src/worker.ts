@@ -19,6 +19,9 @@ if (!dir) {
 const statePath = path.join(dir, "state.json");
 const spec = parseSpec(fs.readFileSync(path.join(dir, "spec.json"), "utf8"));
 
+// 起動側も PID を書くが、起動直後に起動側が死んだ場合に備えて自分でも書く
+writeFileAtomicSync(path.join(dir, "worker.pid"), `${process.pid}\n`);
+
 let latest: RunState | undefined;
 let timer: NodeJS.Timeout | undefined;
 

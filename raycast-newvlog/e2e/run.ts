@@ -412,6 +412,152 @@ async function scenarioSpace(): Promise<void> {
   }
 }
 
+// ---------- E. 同時起動の排他制御 ----------
+
+const RACERS = 8;
+const RACE_ROUNDS = 4;
+
+interface RaceResult {
+  ok: boolean;
+  pid?: number;
+  error?: string;
+}
+
+/** ジョブディレクトリを対象に動いているワーカーの数 */
+function workersFor(env: Env): number {
+  const out = execFileSync("/bin/ps", ["-axo", "command="], { encoding: "utf8" });
+  return out.split("\n").filter((l) => l.includes("worker.js") && l.includes(env.paths.dir)).length;
+}
+
+/** 別プロセスの racer を RACERS 個立て、同じ時刻に一斉に startJob させる */
+async function raceAcrossProcesses(env: Env, spec: JobSpec): Promise<RaceResult[]> {
+  const specFile = path.join(env.base, "race-spec.json");
+  fs.writeFileSync(specFile, serializeSpec(spec));
+  const startAt = Date.now() + 1500; // 全プロセスの起動を待ってから同時に開始
+  const procs = Array.from({ length: RACERS }, () =>
+    spawn(process.execPath, [__filename, "--racer", env.paths.dir, specFile, WORKER, nodePath(), String(startAt)], {
+      stdio: ["ignore", "pipe", "inherit"],
+    }),
+  );
+  return Promise.all(
+    procs.map(
+      (p) =>
+        new Promise<RaceResult>((resolve) => {
+          let out = "";
+          p.stdout.on("data", (c) => (out += String(c)));
+          p.on("exit", () => {
+            try {
+              resolve(JSON.parse(out.trim()) as RaceResult);
+            } catch {
+              resolve({ ok: false, error: `racer の出力を読めません: ${out}` });
+            }
+          });
+        }),
+    ),
+  );
+}
+
+async function raceInProcess(env: Env, spec: JobSpec): Promise<RaceResult[]> {
+  const settled = await Promise.allSettled(
+    Array.from({ length: RACERS }, () =>
+      startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec }),
+    ),
+  );
+  return settled.map((r) =>
+    r.status === "fulfilled" ? { ok: true, pid: r.value } : { ok: false, error: (r.reason as Error).message },
+  );
+}
+
+async function scenarioConcurrentStart(): Promise<void> {
+  scenario = "E. 同時起動の排他制御";
+  console.log(`\n${scenario}`);
+  const total = FILES_PER_DAY * DAYS.length;
+
+  const modes: [string, (env: Env, spec: JobSpec) => Promise<RaceResult[]>][] = [
+    ["別プロセス", raceAcrossProcesses],
+    ["同一プロセス", raceInProcess],
+  ];
+  for (const [label, race] of modes) {
+    for (let round = 1; round <= RACE_ROUNDS; round++) {
+      const env = makeEnv(`e-race-${label === "別プロセス" ? "proc" : "inproc"}-${round}`);
+      const { spec } = await scan(env);
+      const results = await race(env, spec);
+      const winners = results.filter((r) => r.ok);
+      const losers = results.filter((r) => !r.ok);
+      const workers = workersFor(env);
+      const done = await waitFor(env, (s) => s.kind !== "running" && s.kind !== "starting", 120_000);
+      const history = readHistory(env);
+      check(
+        `${label} ×${RACERS} 同時起動 (${round}/${RACE_ROUNDS}): 起動は 1 件だけ`,
+        winners.length === 1 && workers <= 1 && losers.every((r) => r.error?.includes("実行中")),
+        `成功${winners.length} / 拒否${losers.length} / 稼働ワーカー${workers}${
+          losers.find((r) => !r.error?.includes("実行中"))
+            ? ` / 想定外: ${losers.find((r) => !r.error?.includes("実行中"))?.error}`
+            : ""
+        }`,
+      );
+      check(
+        `${label} (${round}/${RACE_ROUNDS}): 転送は完了し履歴に重複がない`,
+        done.kind === "finished" &&
+          done.state.phase === "finished" &&
+          history.length === total &&
+          new Set(history).size === total,
+        `${done.kind} / 履歴${history.length}行 (ユニーク${new Set(history).size})`,
+      );
+    }
+  }
+
+  // ロックを持ったまま死んだプロセスがいても、すぐ次の起動ができる
+  {
+    const env = makeEnv("e-stale-lock");
+    const { spec } = await scan(env);
+    const holder = spawn(process.execPath, [__filename, "--lockholder", env.paths.lock], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    await new Promise<void>((resolve) => holder.stdout.once("data", () => resolve()));
+    let blocked = "";
+    const blockedStart = startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec }).then(
+      () => "started",
+      (e: Error) => e.message,
+    );
+    await sleep(300);
+    blocked = (await Promise.race([blockedStart, sleep(0).then(() => "waiting")])) as string;
+    check("ロック保持中は起動が待たされる", blocked === "waiting", blocked);
+    const t0 = Date.now();
+    holder.kill("SIGKILL");
+    const result = await blockedStart;
+    check(
+      "保持プロセスを SIGKILL するとロックが解放され起動できる",
+      result === "started",
+      `${result} (${Date.now() - t0}ms)`,
+    );
+    await waitFor(env, (s) => s.kind !== "running" && s.kind !== "starting", 120_000);
+  }
+
+  // 実行中のワーカーはロックを継承していない (「実行中」で即座に拒否される)
+  {
+    const env = makeEnv("e-inherit");
+    const { spec } = await scan(env);
+    await startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec });
+    await waitFor(env, (s) => s.kind === "running");
+    const t0 = Date.now();
+    let message = "";
+    try {
+      await startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    const elapsed = Date.now() - t0;
+    check(
+      "ワーカー実行中の起動はロック待ちせず「実行中」で拒否される",
+      message.includes("実行中") && elapsed < 2000,
+      `${message} (${elapsed}ms)`,
+    );
+    await cancelJob(env.paths);
+    await waitFor(env, (s) => s.kind !== "running");
+  }
+}
+
 // ---------- レポート ----------
 
 function writeReport(startedAt: Date): boolean {
@@ -449,12 +595,42 @@ async function main(): Promise<void> {
     process.kill(process.pid, "SIGKILL");
     return;
   }
+  // 同時起動テストの競争相手
+  if (process.argv[2] === "--racer") {
+    const [, , , dir, specFile, worker, node, startAt] = process.argv;
+    const paths = jobPaths(path.dirname(dir));
+    const spec = parseSpec(fs.readFileSync(specFile, "utf8"));
+    while (Date.now() < Number(startAt)) await sleep(1);
+    let result: RaceResult;
+    try {
+      result = { ok: true, pid: await startJob({ paths, workerScript: worker, nodePath: node, spec }) };
+    } catch (e) {
+      result = { ok: false, error: (e as Error).message };
+    }
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  // ロックを取ったまま居座るプロセス (SIGKILL で殺される役)
+  if (process.argv[2] === "--lockholder") {
+    fs.mkdirSync(path.dirname(process.argv[3]), { recursive: true });
+    const { O_RDWR, O_CREAT } = fs.constants;
+    fs.openSync(process.argv[3], O_RDWR | O_CREAT | 0x20 /* O_EXLOCK */);
+    process.stdout.write("locked\n");
+    setInterval(() => {}, 1000);
+    return;
+  }
 
   const startedAt = new Date();
   if (!fs.existsSync(WORKER)) throw new Error("assets/worker.js がありません (npm run build:worker)");
   fs.rmSync(SANDBOX, { recursive: true, force: true });
 
-  for (const s of [scenarioHappyPath, scenarioDoubleStartAndCancel, scenarioCrashAndResume, scenarioSpace]) {
+  for (const s of [
+    scenarioHappyPath,
+    scenarioDoubleStartAndCancel,
+    scenarioCrashAndResume,
+    scenarioSpace,
+    scenarioConcurrentStart,
+  ]) {
     try {
       await s();
     } catch (e) {

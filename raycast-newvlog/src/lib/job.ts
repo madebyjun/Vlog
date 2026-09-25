@@ -22,6 +22,8 @@ export interface JobPaths {
   pid: string;
   /** ワーカーの stdout/stderr */
   workerLog: string;
+  /** 起動・片付けの排他ロック (ジョブディレクトリごと消すので外に置く) */
+  lock: string;
 }
 
 export function jobPaths(supportPath: string): JobPaths {
@@ -32,6 +34,7 @@ export function jobPaths(supportPath: string): JobPaths {
     state: path.join(dir, "state.json"),
     pid: path.join(dir, "worker.pid"),
     workerLog: path.join(dir, "worker.log"),
+    lock: path.join(supportPath, "job.lock"),
   };
 }
 
@@ -163,6 +166,43 @@ export async function readJob(paths: JobPaths): Promise<JobStatus> {
   return { kind: "running", state: file.state };
 }
 
+// ---------- 排他制御 ----------
+
+/** macOS の <fcntl.h> の O_EXLOCK (Node の fs.constants には定義がない) */
+const O_EXLOCK = 0x20;
+const LOCK_TIMEOUT_MS = 10_000;
+const LOCK_RETRY_MS = 25;
+
+/**
+ * ジョブの起動・片付けを排他的に実行する。
+ * O_EXLOCK は flock 相当のカーネルロックで、同一プロセス内の別 open とも競合し、
+ * 保持プロセスが死ねば OS が解放する (ロックファイルが残っても次回の取得を妨げない)。
+ */
+async function withJobLock<T>(paths: JobPaths, fn: () => Promise<T>): Promise<T> {
+  await fsp.mkdir(path.dirname(paths.lock), { recursive: true });
+  const { O_RDWR, O_CREAT, O_NONBLOCK } = fs.constants;
+  const until = Date.now() + LOCK_TIMEOUT_MS;
+  let fd: number;
+  for (;;) {
+    try {
+      fd = fs.openSync(paths.lock, O_RDWR | O_CREAT | O_EXLOCK | O_NONBLOCK);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EAGAIN" && code !== "EWOULDBLOCK") throw error;
+      if (Date.now() > until) {
+        throw new Error("別の転送の開始処理が終わりません。しばらく待ってから再実行してください。");
+      }
+      await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 // ---------- 操作 ----------
 
 export interface StartJobOptions {
@@ -176,8 +216,15 @@ export interface StartJobOptions {
   env?: Record<string, string>;
 }
 
-/** ワーカーを切り離して起動する。起動を確認したら戻る (転送の完了は待たない) */
-export async function startJob(options: StartJobOptions): Promise<number> {
+/**
+ * ワーカーを切り離して起動する。起動を確認したら戻る (転送の完了は待たない)。
+ * 同時に呼ばれても、ロックの中で既存ジョブを確認するので起動されるのは 1 つだけ。
+ */
+export function startJob(options: StartJobOptions): Promise<number> {
+  return withJobLock(options.paths, () => startJobLocked(options));
+}
+
+async function startJobLocked(options: StartJobOptions): Promise<number> {
   const { paths, workerScript, nodePath, spec } = options;
 
   const current = await readJob(paths);
@@ -227,9 +274,11 @@ export async function cancelJob(paths: JobPaths): Promise<boolean> {
 }
 
 /** 終了済みのジョブを片付ける。実行中なら false */
-export async function clearJob(paths: JobPaths): Promise<boolean> {
-  const status = await readJob(paths);
-  if (status.kind === "starting" || status.kind === "running") return false;
-  await fsp.rm(paths.dir, { recursive: true, force: true });
-  return true;
+export function clearJob(paths: JobPaths): Promise<boolean> {
+  return withJobLock(paths, async () => {
+    const status = await readJob(paths);
+    if (status.kind === "starting" || status.kind === "running") return false;
+    await fsp.rm(paths.dir, { recursive: true, force: true });
+    return true;
+  });
 }
