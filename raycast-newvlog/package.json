@@ -20,52 +20,28 @@
       "subtitle": "New Vlog",
       "description": "接続されたデバイスをスキャンし、日付ごとの転送先を決めてSSDへ転送します",
       "mode": "view"
-    }
-  ],
-  "preferences": [
-    {
-      "name": "ssdUuid",
-      "type": "textfield",
-      "required": true,
-      "title": "SSD UUID",
-      "description": "保存先SSDのVolume UUID (diskutil info で確認できます)",
-      "placeholder": "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
     },
     {
-      "name": "cutoffTime",
-      "type": "textfield",
-      "required": false,
-      "title": "日付切り替え時刻",
-      "description": "この時刻より前に撮影されたファイルは前日の撮影として扱います (HH:MM, 24時間形式)",
-      "default": "04:00",
-      "placeholder": "04:00"
+      "name": "transfer-status",
+      "title": "Vlog Transfer Status",
+      "subtitle": "New Vlog",
+      "description": "バックグラウンド転送の進捗・速度・残り時間をメニューバーに表示します (転送していないときは前回の取り込みと各コマンドへの入り口)",
+      "mode": "menu-bar",
+      "interval": "10s"
     },
     {
-      "name": "spaceMarginGb",
-      "type": "textfield",
-      "required": false,
-      "title": "安全マージン (GB)",
-      "description": "転送予定サイズ + マージンがSSDの空き容量を超える場合に警告します",
-      "default": "2",
-      "placeholder": "2"
+      "name": "import-history",
+      "title": "Vlog Import History",
+      "subtitle": "New Vlog",
+      "description": "過去の取り込み結果 (転送したプロジェクト・ファイル数・失敗) を一覧します",
+      "mode": "view"
     },
     {
-      "name": "defaultTitle",
-      "type": "textfield",
-      "required": false,
-      "title": "デフォルトタイトル",
-      "description": "新規プロジェクトのタイトルを空欄にした場合に使われます",
-      "default": "NewProject",
-      "placeholder": "NewProject"
-    },
-    {
-      "name": "openInFinder",
-      "type": "checkbox",
-      "required": false,
-      "title": "転送完了後",
-      "label": "プロジェクトフォルダをFinderで開く",
-      "default": true,
-      "description": "各日付の転送が完了するたびに、プロジェクトフォルダをFinderで開きます"
+      "name": "configure",
+      "title": "Configure Vlog Import",
+      "subtitle": "New Vlog",
+      "description": "保存先SSD・日付の切り替え時刻・既定の Tier などを設定します",
+      "mode": "view"
     }
   ],
   "dependencies": {

@@ -16,8 +16,19 @@ export const TIER_DESCRIPTIONS: Record<Tier, string> = {
   TIER_3__TEMP: "一時保存素材 - テスト撮影・草稿",
 };
 
-// --- 除外設定 (zsh のグロブパターン) ---
-export const EXCLUDE_PATTERNS = ["*.LRF"];
+/** 画面に出す短い名前 */
+export const TIER_LABELS: Record<Tier, string> = {
+  TIER_1__KEEP: "Keep",
+  TIER_2__STORE: "Store",
+  TIER_3__TEMP: "Temp",
+};
+
+export function isTier(value: string): value is Tier {
+  return (TIER_FOLDERS as readonly string[]).includes(value);
+}
+
+// --- 除外設定の既定値 (zsh のグロブパターン。設定画面で変更できる) ---
+export const DEFAULT_EXCLUDE_PATTERNS = ["*.LRF"];
 
 // --- デバイス検出ルール ---
 // UUIDではなく、ボリューム内のフォルダ構成で自動検出します。

@@ -9,21 +9,31 @@ import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { computeSpaceInfo } from "../src/lib/engine";
+import { RunState, computeSpaceInfo } from "../src/lib/engine";
+import { readHistory as readRunHistory } from "../src/lib/history";
 import {
   JobPaths,
   JobSpec,
   JobStatus,
   cancelJob,
+  clearJob,
   jobPaths,
   parseSpec,
   readJob,
   serializeSpec,
   startJob,
 } from "../src/lib/job";
-import type { Plan } from "../src/lib/plan";
+import { Plan, applyPlan, suggestPlan } from "../src/lib/plan";
+import { progressStats } from "../src/lib/progress";
 import { DateGroup, detectDevices, scanDevice } from "../src/lib/scan";
-import type { Settings } from "../src/lib/settings";
+import {
+  DEFAULT_INPUT,
+  Settings,
+  SettingsInput,
+  loadSettingsFrom,
+  saveSettingsTo,
+  validateSettings,
+} from "../src/lib/settings";
 import type { SsdContext } from "../src/lib/ssd";
 
 const ROOT = path.resolve(__dirname, "..", "..");
@@ -129,7 +139,10 @@ function makeEnv(name: string): Env {
       spaceMarginGb: 0,
       spaceMarginBytes: 0,
       defaultTitle: "NewProject",
+      defaultTier: "TIER_2__STORE",
+      excludePatterns: ["*.LRF"],
       openInFinder: false,
+      notify: false,
     },
     volumes,
     existingProject,
@@ -302,6 +315,24 @@ async function scenarioHappyPath(): Promise<void> {
   check("ワーカーは終了後に自分で終了する", await eventually(() => !processExists(pid)));
   check("caffeinate もワーカーと一緒に終了した", await eventually(() => !caffeinateFor(pid)));
   check("ログファイルが保存された", Boolean(state?.logFile && fs.existsSync(state.logFile)), state?.logFile ?? "");
+
+  const history = await readRunHistory(path.join(env.base, "support", "logs"));
+  const entry = history[0];
+  check(
+    "[#23] 完了したジョブの要約が履歴として読める",
+    history.length === 1 &&
+      entry.kind === "run" &&
+      entry.summary.phase === "finished" &&
+      entry.summary.doneFiles === total,
+    `${history.length}件 / ${entry?.kind}`,
+  );
+  check(
+    "[#23] 要約にプロジェクトと保存先SSDが記録される",
+    entry?.kind === "run" &&
+      entry.summary.ssdMount === env.ctx.mount &&
+      entry.summary.groups.every((g) => Boolean(g.projectDir)) &&
+      !("log" in entry.summary),
+  );
 }
 
 async function scenarioDoubleStartAndCancel(): Promise<void> {
@@ -319,6 +350,8 @@ async function scenarioDoubleStartAndCancel(): Promise<void> {
     rejected = (e as Error).message;
   }
   check("実行中の二重起動は拒否される", rejected.includes("実行中"), rejected);
+  check("[#27] 実行中のジョブは clearJob で消せない", (await clearJob(env.paths)) === false);
+  check("[#27] clearJob を拒否した後もジョブは実行中のまま", (await readJob(env.paths)).kind === "running");
 
   const pid = workerPid(env);
   check("cancelJob が SIGTERM を送れた", await cancelJob(env.paths));
@@ -341,6 +374,13 @@ async function scenarioDoubleStartAndCancel(): Promise<void> {
     .split("\n")
     .some((l) => l.includes("rsync") && l.includes(env.base));
   check("rsync が残っていない", !rsyncLeft);
+
+  const history = await readRunHistory(path.join(env.base, "support", "logs"));
+  check(
+    "[#23] 中止したジョブの要約も履歴に残る",
+    history.length === 1 && history[0].kind === "run" && history[0].summary.phase === "aborted",
+    `${history.length}件`,
+  );
 }
 
 async function scenarioCrashAndResume(): Promise<void> {
@@ -558,13 +598,482 @@ async function scenarioConcurrentStart(): Promise<void> {
   }
 }
 
+// ---------- F. 設定ファイル ----------
+
+async function scenarioSettings(): Promise<void> {
+  scenario = "F. 設定ファイルの読み書き (#17〜#19)";
+  console.log(`\n${scenario}`);
+  const dir = path.join(SANDBOX, "f-settings");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "settings.json");
+
+  check("[#17] ファイルが無ければ未設定", loadSettingsFrom(file).kind === "missing");
+  fs.writeFileSync(file, "{ broken");
+  check("[#17] 壊れた JSON は未設定扱い (例外にならない)", loadSettingsFrom(file).kind === "missing");
+  fs.writeFileSync(file, "[1,2]");
+  check("[#17] オブジェクトでない JSON も未設定扱い", loadSettingsFrom(file).kind === "missing");
+  fs.writeFileSync(file, JSON.stringify({ cutoffTime: "05:00" }));
+  check("[#17] SSD が未選択なら未設定扱い", loadSettingsFrom(file).kind === "missing");
+
+  fs.writeFileSync(file, JSON.stringify({ ssdUuid: "UUID-1" }));
+  const partial = loadSettingsFrom(file);
+  check(
+    "[#17] SSD だけの設定は、他の項目が既定値で補われる",
+    partial.kind === "ok" &&
+      partial.settings.cutoffTime === "04:00" &&
+      partial.settings.spaceMarginGb === 2 &&
+      partial.settings.defaultTitle === "NewProject" &&
+      partial.settings.defaultTier === "TIER_2__STORE" &&
+      partial.settings.excludePatterns.join() === "*.LRF" &&
+      partial.settings.openInFinder &&
+      partial.settings.notify,
+    JSON.stringify(partial.kind === "ok" ? partial.settings : partial),
+  );
+
+  fs.writeFileSync(file, JSON.stringify({ ssdUuid: "UUID-1", cutoffTime: "25:00", spaceMarginGb: -1 }));
+  const invalid = loadSettingsFrom(file);
+  check(
+    "[#17] 手で壊された値は invalid として項目ごとのエラーを返す",
+    invalid.kind === "invalid" && Boolean(invalid.errors.cutoffTime) && Boolean(invalid.errors.spaceMarginGb),
+    invalid.kind === "invalid" ? Object.keys(invalid.errors).join(",") : invalid.kind,
+  );
+
+  const good: SettingsInput = { ...DEFAULT_INPUT, ssdUuid: "UUID-2", excludePatterns: "*.LRF, *.THM" };
+  const cases: [keyof SettingsInput, Partial<SettingsInput>][] = [
+    ["ssdUuid", { ssdUuid: "  " }],
+    ["cutoffTime", { cutoffTime: "25:00" }],
+    ["cutoffTime", { cutoffTime: "4:00" }],
+    ["spaceMarginGb", { spaceMarginGb: "-1" }],
+    ["spaceMarginGb", { spaceMarginGb: "abc" }],
+    ["spaceMarginGb", { spaceMarginGb: "" }],
+    ["defaultTitle", { defaultTitle: "a/b" }],
+    ["defaultTier", { defaultTier: "TIER_9" }],
+    ["excludePatterns", { excludePatterns: "*.LRF, sub/*.MP4" }],
+  ];
+  for (const [key, patch] of cases) {
+    const result = validateSettings({ ...good, ...patch });
+    check(
+      `[#18] 不正な ${key} (${JSON.stringify(Object.values(patch)[0])}) は保存できず、その項目にエラーが出る`,
+      !result.settings && Boolean(result.errors[key]) && Object.keys(result.errors).length === 1,
+      JSON.stringify(result.errors),
+    );
+  }
+
+  const valid = validateSettings(good);
+  check("[#18] 正しい入力は検証を通る", Boolean(valid.settings), JSON.stringify(valid.errors));
+  if (!valid.settings) return;
+  saveSettingsTo(file, valid.settings);
+  const reloaded = loadSettingsFrom(file);
+  check(
+    "[#18] 保存した設定を読み直すと同じ値になる",
+    reloaded.kind === "ok" && JSON.stringify(reloaded.settings) === JSON.stringify(valid.settings),
+  );
+  check(
+    "[#18] 空のタイトルは既定値になる",
+    validateSettings({ ...good, defaultTitle: "  " }).settings?.defaultTitle === "NewProject",
+  );
+
+  // 別プロセスが保存し続ける間に読み続け、壊れた設定を一度も見ないこと
+  const writer = spawn(process.execPath, [__filename, "--settings-writer", file], { stdio: "ignore" });
+  let reads = 0;
+  let bad = 0;
+  const until = Date.now() + 1500;
+  while (Date.now() < until) {
+    const r = loadSettingsFrom(file);
+    reads += 1;
+    if (r.kind !== "ok") bad += 1;
+    if (reads % 50 === 0) await sleep(1);
+  }
+  writer.kill("SIGKILL");
+  check("[#19] 保存中に読んでも常に有効な設定が読める", bad === 0 && reads > 100, `${reads}回中 ${bad}回失敗`);
+}
+
+// ---------- G. 除外パターン ----------
+
+async function scenarioExcludePatterns(): Promise<void> {
+  scenario = "G. 除外パターンの設定がスキャンに反映される (#20)";
+  console.log(`\n${scenario}`);
+  const env = makeEnv("g-exclude");
+  const count = async (patterns: string[]) => {
+    env.settings.excludePatterns = patterns;
+    const { groups } = await scan(env);
+    const names = groups.flatMap((g) => g.files.map((f) => f.name));
+    return { total: names.length, lrf: names.filter((n) => n.endsWith(".LRF")).length };
+  };
+  const all = FILES_PER_DAY * DAYS.length;
+  const lrf = await count(["*.LRF"]);
+  check("[#20] *.LRF で .LRF が除外される", lrf.lrf === 0 && lrf.total === all, JSON.stringify(lrf));
+  const none = await count([]);
+  check("[#20] 除外なしなら .LRF も対象になる", none.lrf === 1 && none.total === all + 1, JSON.stringify(none));
+  const mp4 = await count(["*.MP4", "*.LRF"]);
+  check("[#20] 複数パターンがすべて効く", mp4.total === 0, JSON.stringify(mp4));
+  const day = await count(["DJI_20260921*"]);
+  check("[#20] * のパターンで特定の日付だけ除外できる", day.total === FILES_PER_DAY + 1, JSON.stringify(day));
+  const q = await count(["*.LR?"]);
+  check("[#20] ? のパターンが効く", q.lrf === 0 && q.total === all, JSON.stringify(q));
+}
+
+// ---------- H. スキップと進捗・速度・残り時間 ----------
+
+async function scenarioSkipAndProgress(): Promise<void> {
+  scenario = "H. スキップした日付と進捗・速度・残り時間 (#21, #22, #28)";
+  console.log(`\n${scenario}`);
+  const env = makeEnv("h-skip");
+  const { spec, groups } = await scan(env);
+  const skipped = groups.find((g) => g.date === "2026-09-21");
+  if (!skipped) throw new Error("2日目のグループがありません");
+  spec.input.plans[skipped.id] = { kind: "skip" };
+  // スキップする日付だけ巨大にする: スキップ分を容量計算に含めると未承認で中止になる
+  skipped.totalBytes = 1e18;
+
+  await startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec });
+  const samples: RunState[] = [];
+  const done = await waitFor(
+    env,
+    (s) => {
+      if (s.kind === "running") samples.push(s.state);
+      return s.kind !== "running" && s.kind !== "starting";
+    },
+    60_000,
+  );
+  const state = done.kind === "finished" ? done.state : undefined;
+  check(
+    "[#28] スキップした日付は容量チェックに含まれない (中止されない)",
+    state?.phase === "finished",
+    `${state?.phase} ${state?.fatalError ?? ""}`,
+  );
+  check(
+    "[#21] 合計はスキップ分を含まない",
+    state?.totalFiles === FILES_PER_DAY && state.totalBytes === FILES_PER_DAY * FILE_BYTES,
+    `${state?.totalFiles}ファイル / ${state?.totalBytes}B`,
+  );
+  check(
+    "[#21] スキップした日付は最初から skipped",
+    samples.length > 0 && samples.every((s) => s.groups.find((g) => g.id === skipped.id)?.status === "skipped"),
+    `${samples.length}サンプル`,
+  );
+
+  const now = Date.now();
+  const running = samples.map((s) => progressStats(s, now));
+  const finite = (n: number | undefined) => n === undefined || (Number.isFinite(n) && n >= 0);
+  check(
+    "[#22] 転送中の進捗・速度・残り時間は常に有限",
+    running.every((p) => p.ratio >= 0 && p.ratio <= 1 && finite(p.bytesPerSec) && finite(p.etaMs)),
+    `${running.length}サンプル`,
+  );
+  check(
+    "[#22] 進捗は後戻りしない",
+    running.every((p, i) => i === 0 || p.processedBytes >= running[i - 1].processedBytes),
+  );
+  const beforeTransfer = samples.filter((s) => s.transferStartedAt === undefined).map((s) => progressStats(s, now));
+  check(
+    "[#22] 転送開始前は速度・残り時間を出さない",
+    beforeTransfer.every((p) => p.bytesPerSec === undefined && p.etaMs === undefined),
+    `${beforeTransfer.length}サンプル`,
+  );
+  if (state) {
+    const final = progressStats(state);
+    check("[#21] 完了時は 100%", final.ratio === 1 && final.processedBytes === final.totalBytes, `${final.ratio}`);
+    check("[#22] 完了後は残り時間を出さない", final.etaMs === undefined);
+  }
+
+  // 速度・残り時間の計算そのもの (転送開始から 10 秒で 1/4 → 速度一定なら残り 30 秒)
+  const base = samples[0] ?? state;
+  if (base) {
+    const t0 = 1_000_000;
+    const synthetic: RunState = {
+      ...base,
+      phase: "running",
+      startedAt: t0 - 5000,
+      transferStartedAt: t0,
+      finishedAt: undefined,
+      totalBytes: 400,
+      doneBytes: 100,
+      failedBytes: 0,
+      groups: base.groups.map((g) => ({ ...g, status: "done" as const })),
+    };
+    const p = progressStats(synthetic, t0 + 10_000);
+    check(
+      "[#22] 速度 = 処理済み ÷ 転送開始からの時間、残り = 残量 ÷ 速度",
+      p.bytesPerSec === 10 && p.etaMs === 30_000 && p.ratio === 0.25 && p.elapsedMs === 15_000,
+      JSON.stringify(p),
+    );
+    const early = progressStats(synthetic, t0 + 500);
+    check("[#22] 計測 2 秒未満は速度を出さない (極端な値を避ける)", early.bytesPerSec === undefined);
+    const empty = progressStats(
+      { ...synthetic, totalBytes: 0, doneBytes: 0, totalFiles: 0, doneFiles: 0 },
+      t0 + 10_000,
+    );
+    check("[#22] 合計 0 でも NaN にならない", empty.ratio === 0 && empty.bytesPerSec === undefined);
+  }
+}
+
+// ---------- I. 履歴の読み込み ----------
+
+async function scenarioHistoryFiles(): Promise<void> {
+  scenario = "I. 履歴ファイルの読み込み (#24)";
+  console.log(`\n${scenario}`);
+  const dir = path.join(SANDBOX, "i-history");
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  const summary = (startedAt: number) =>
+    JSON.stringify({
+      version: 1,
+      startedAt,
+      groups: [],
+      failed: [],
+      phase: "finished",
+      ssdMount: "/x",
+      footageRoot: "/x/f",
+    });
+
+  fs.writeFileSync(path.join(dir, "newvlog-20260901-100000.log"), "old\n");
+  fs.writeFileSync(path.join(dir, "newvlog-20260910-100000.log"), "new\n");
+  fs.writeFileSync(path.join(dir, "newvlog-20260910-100000.json"), summary(Date.UTC(2026, 8, 10, 10)));
+  fs.writeFileSync(path.join(dir, "newvlog-20260905-100000.log"), "broken summary\n");
+  fs.writeFileSync(path.join(dir, "newvlog-20260905-100000.json"), "{ not json");
+  fs.writeFileSync(path.join(dir, "newvlog-20260906-100000.json"), JSON.stringify({ version: 2 }));
+  fs.writeFileSync(path.join(dir, "newvlog-20260907-100000.json.tmp"), summary(0));
+  fs.writeFileSync(path.join(dir, "unrelated.txt"), "x");
+
+  const entries = await readRunHistory(dir);
+  check(
+    "[#24] 壊れた要約・未知の形式・書きかけは無視し、読める分を返す",
+    entries.length === 3,
+    entries.map((e) => `${e.kind}:${e.id}`).join(", "),
+  );
+  check(
+    "[#24] 要約のあるログは run、無い (壊れた) ものは legacy",
+    entries[0]?.kind === "run" && entries[1]?.kind === "legacy" && entries[2]?.kind === "legacy",
+  );
+  check(
+    "[#24] 新しい順に並ぶ",
+    entries.every((e, i) => i === 0 || entries[i - 1].startedAt >= e.startedAt),
+  );
+  check("[#24] ログフォルダが無くても空で返る", (await readRunHistory(path.join(dir, "nope"))).length === 0);
+}
+
+// ---------- J. プランの自動提案 ----------
+
+async function scenarioSuggestPlan(): Promise<void> {
+  scenario = "J. プランの自動提案 (#25)";
+  console.log(`\n${scenario}`);
+  const env = makeEnv("j-suggest");
+  const { groups } = await scan(env);
+  const g = groups[0];
+  const defaults = { defaultTitle: "Trip", defaultTier: "TIER_1__KEEP" as const };
+  const p = (tier: "TIER_1__KEEP" | "TIER_2__STORE", name: string) => ({ tier, name, path: `/x/${tier}/${name}` });
+
+  const none = suggestPlan({ ...g, existing: [] }, defaults);
+  check(
+    "[#25] 既存が無ければ既定のタイトル・Tier で新規",
+    none?.kind === "new" && none.title === "Trip" && none.tier === "TIER_1__KEEP",
+    JSON.stringify(none),
+  );
+  const one = suggestPlan({ ...g, existing: [p("TIER_2__STORE", "2026-09-20-A")] }, defaults);
+  check(
+    "[#25] 既存が 1 つならそれを使う",
+    one?.kind === "existing" && one.projectDir === "/x/TIER_2__STORE/2026-09-20-A",
+    JSON.stringify(one),
+  );
+  const two = suggestPlan(
+    { ...g, existing: [p("TIER_2__STORE", "2026-09-20-A"), p("TIER_1__KEEP", "2026-09-20-B")] },
+    defaults,
+  );
+  check("[#25] 既存が 2 つ以上なら未決定のまま", two === undefined, JSON.stringify(two));
+}
+
+// ---------- K. 同じ撮影日の複数デバイス ----------
+
+const MIC_FILES = 10;
+const MIC_BYTES = 16 * 1024;
+
+/** 偽の DJI Mic を追加する (Osmo の 1 日目と同じ撮影日) */
+function addMic(env: Env): void {
+  const src = path.join(env.volumes, "MIC", "DJI_Audio_001");
+  fs.mkdirSync(src, { recursive: true });
+  const payload = Buffer.alloc(MIC_BYTES, 3);
+  for (let i = 0; i < MIC_FILES; i++) {
+    fs.writeFileSync(path.join(src, `DJI_29_20260920_17${String(i).padStart(2, "0")}00.WAV`), payload);
+  }
+}
+
+/** Tier フォルダ内の「2026-09-20-*」プロジェクト */
+function projectsOn(env: Env, tier: string, date = "2026-09-20"): string[] {
+  const dir = path.join(env.ctx.footageRoot, tier);
+  return fs.existsSync(dir)
+    ? fs
+        .readdirSync(dir)
+        .filter((n) => n.startsWith(`${date}-`))
+        .sort()
+    : [];
+}
+
+async function runToEnd(env: Env, spec: JobSpec): Promise<RunState | undefined> {
+  await startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec });
+  const done = await waitFor(env, (s) => s.kind !== "running" && s.kind !== "starting");
+  return done.kind === "finished" ? done.state : undefined;
+}
+
+async function scenarioSameDayDevices(): Promise<void> {
+  scenario = "K. 同じ撮影日の複数デバイス (#29〜#32)";
+  console.log(`\n${scenario}`);
+
+  // #30: 自動提案のまま転送すると、同日の Osmo と Mic が 1 つの新規プロジェクトに入る
+  {
+    const env = makeEnv("k-shared");
+    addMic(env);
+    const { spec, groups } = await scan(env);
+    const sameDay = groups.filter((g) => g.date === "2026-09-20");
+    check("同じ撮影日のグループが 2 デバイス分ある", sameDay.length === 2, sameDay.map((g) => g.id).join(", "));
+    spec.input.plans = {};
+    for (const g of groups) {
+      const plan = suggestPlan(g, env.settings);
+      if (plan) spec.input.plans[g.id] = plan;
+    }
+    check(
+      "自動提案では同日の 2 デバイスが同じ新規プランになる",
+      sameDay.every(
+        (g) => JSON.stringify(spec.input.plans[g.id]) === JSON.stringify(spec.input.plans[sameDay[0].id]),
+      ) && spec.input.plans[sameDay[0].id]?.kind === "new",
+    );
+    const state = await runToEnd(env, spec);
+    const projects = projectsOn(env, "TIER_2__STORE");
+    check("転送が完了する", state?.phase === "finished" && state.failed.length === 0, `${state?.phase}`);
+    check(
+      "[#30] 新規プロジェクトは 1 つだけ (-1 ができない)",
+      projects.join() === "2026-09-20-NewProject",
+      projects.join(", "),
+    );
+    const project = path.join(env.ctx.footageRoot, "TIER_2__STORE", "2026-09-20-NewProject");
+    check(
+      "[#30] 1 つのプロジェクトに両デバイスのサブフォルダが入る",
+      fs.readdirSync(path.join(project, "DJI_001")).length === FILES_PER_DAY &&
+        fs.readdirSync(path.join(project, "DJI_Audio_001")).length === MIC_FILES,
+    );
+    check(
+      "[#30] 両デバイスの進捗が同じプロジェクトを指す",
+      state?.groups.filter((g) => g.date === "2026-09-20").every((g) => g.projectDir === project) === true,
+    );
+    check(
+      "[#30] 共有プロジェクトにテンプレートがコピーされている",
+      fs.existsSync(path.join(project, "Edit/project.txt")),
+    );
+  }
+
+  // #31: 同名フォルダが既にあれば、両デバイスとも同じ連番 (-1) に入る
+  {
+    const env = makeEnv("k-suffix");
+    addMic(env);
+    fs.mkdirSync(path.join(env.ctx.footageRoot, "TIER_3__TEMP", "2026-09-20-Trip"), { recursive: true });
+    const { spec, groups } = await scan(env);
+    for (const g of groups) {
+      if (g.date === "2026-09-20") spec.input.plans[g.id] = { kind: "new", title: "Trip", tier: "TIER_3__TEMP" };
+    }
+    const state = await runToEnd(env, spec);
+    const projects = projectsOn(env, "TIER_3__TEMP");
+    check(
+      "[#31] 既存の同名フォルダがあっても、共有プロジェクトは -1 の 1 つだけ",
+      state?.phase === "finished" && projects.join() === "2026-09-20-Trip,2026-09-20-Trip-1",
+      projects.join(", "),
+    );
+    const shared = path.join(env.ctx.footageRoot, "TIER_3__TEMP", "2026-09-20-Trip-1");
+    check(
+      "[#31] 両デバイスが -1 に入る",
+      fs.existsSync(path.join(shared, "DJI_001")) && fs.existsSync(path.join(shared, "DJI_Audio_001")),
+    );
+  }
+
+  // #32: タイトルが違えば別プロジェクト
+  {
+    const env = makeEnv("k-separate");
+    addMic(env);
+    const { spec, groups } = await scan(env);
+    for (const g of groups) {
+      if (g.date === "2026-09-20")
+        spec.input.plans[g.id] = {
+          kind: "new",
+          title: g.device.name.startsWith("DJI_Mic") ? "Audio" : "Video",
+          tier: "TIER_2__STORE",
+        };
+    }
+    const state = await runToEnd(env, spec);
+    const projects = projectsOn(env, "TIER_2__STORE");
+    check(
+      "[#32] タイトルが違えば別々のプロジェクトになる",
+      state?.phase === "finished" && projects.join() === "2026-09-20-Audio,2026-09-20-Video",
+      projects.join(", "),
+    );
+  }
+
+  // #32: プラン変更の伝播ルール
+  {
+    const groups = [
+      { id: "osmo|20", date: "2026-09-20" },
+      { id: "mic|20", date: "2026-09-20" },
+      { id: "osmo|21", date: "2026-09-21" },
+    ];
+    const base: Plan = { kind: "new", title: "NewProject", tier: "TIER_2__STORE" };
+    const trip: Plan = { kind: "new", title: "Trip", tier: "TIER_1__KEEP" };
+    const other: Plan = { kind: "existing", projectDir: "/x/Y", projectName: "Y" };
+    const same = (a: Plan | undefined, b: Plan | undefined) => JSON.stringify(a) === JSON.stringify(b);
+
+    const renamed = applyPlan({ "osmo|20": base, "mic|20": base, "osmo|21": base }, groups, "osmo|20", trip);
+    check(
+      "[#32] 共有していた新規プロジェクトのタイトルを変えると、同日の別デバイスも変わる",
+      same(renamed["osmo|20"], trip) && same(renamed["mic|20"], trip),
+    );
+    check("[#32] 別の撮影日には伝播しない", same(renamed["osmo|21"], base));
+
+    const filled = applyPlan({}, groups, "osmo|20", other);
+    check("[#32] 同日の未決定のデバイスにも同じ転送先が入る", same(filled["mic|20"], other) && !filled["osmo|21"]);
+
+    const separate = applyPlan({ "osmo|20": base, "mic|20": other }, groups, "osmo|20", trip);
+    check("[#32] 別の転送先を選んでいたデバイスは変えない", same(separate["mic|20"], other));
+
+    const skipped = applyPlan({ "osmo|20": base, "mic|20": base }, groups, "osmo|20", { kind: "skip" });
+    check("[#32] スキップは伝播しない", skipped["osmo|20"]?.kind === "skip" && same(skipped["mic|20"], base));
+
+    const cleared = applyPlan({ "osmo|20": base, "mic|20": base }, groups, "osmo|20", undefined);
+    check("[#32] 未決定に戻すのはその日付だけ", !cleared["osmo|20"] && same(cleared["mic|20"], base));
+
+    const afterSkip = applyPlan({ "osmo|20": { kind: "skip" }, "mic|20": { kind: "skip" } }, groups, "osmo|20", trip);
+    check(
+      "[#32] スキップ同士は「共有」とみなさない",
+      same(afterSkip["osmo|20"], trip) && afterSkip["mic|20"]?.kind === "skip",
+    );
+  }
+
+  // #29: 画面の戻り方 (ソースに popToRoot の呼び出しが無い)
+  {
+    const srcDir = path.join(ROOT, "src");
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (/\.tsx?$/.test(e.name) && /\bpopToRoot\s*\(/.test(fs.readFileSync(full, "utf8"))) {
+          offenders.push(path.relative(ROOT, full));
+        }
+      }
+    };
+    walk(srcDir);
+    check(
+      "[#29] popToRoot() を呼んでいない (検索画面まで戻ってプランが消えるため)",
+      offenders.length === 0,
+      offenders.join(", "),
+    );
+  }
+}
+
 // ---------- レポート ----------
 
 function writeReport(startedAt: Date): boolean {
   const passed = checks.filter((c) => c.ok).length;
   const allOk = passed === checks.length;
   const lines = [
-    "# バックグラウンド転送 E2E レポート",
+    "# New Vlog Import E2E レポート",
     "",
     `- 実行日時: ${startedAt.toISOString()}`,
     `- ワーカー: \`assets/worker.js\` / node: \`${nodePath()}\` (${execFileSync(nodePath(), ["-v"], { encoding: "utf8" }).trim()})`,
@@ -610,6 +1119,16 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
+  // 設定を保存し続けるプロセス (F の同時読み書き用)
+  if (process.argv[2] === "--settings-writer") {
+    const file = process.argv[3];
+    const { settings } = validateSettings({ ...DEFAULT_INPUT, ssdUuid: "UUID-W" });
+    if (!settings) throw new Error("invalid");
+    for (let i = 0; ; i++) {
+      saveSettingsTo(file, { ...settings, defaultTitle: `T${i}`.repeat(1 + (i % 50)) });
+      if (i % 20 === 0) await sleep(0);
+    }
+  }
   // ロックを取ったまま居座るプロセス (SIGKILL で殺される役)
   if (process.argv[2] === "--lockholder") {
     fs.mkdirSync(path.dirname(process.argv[3]), { recursive: true });
@@ -630,6 +1149,12 @@ async function main(): Promise<void> {
     scenarioCrashAndResume,
     scenarioSpace,
     scenarioConcurrentStart,
+    scenarioSettings,
+    scenarioExcludePatterns,
+    scenarioSkipAndProgress,
+    scenarioHistoryFiles,
+    scenarioSuggestPlan,
+    scenarioSameDayDevices,
   ]) {
     try {
       await s();

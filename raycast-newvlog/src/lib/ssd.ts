@@ -92,3 +92,59 @@ export async function getFreeBytes(mount: string): Promise<number> {
   }
   return Number(freeKb) * 1024;
 }
+
+export interface VolumeInfo {
+  uuid: string;
+  name: string;
+  mount: string;
+  internal: boolean;
+  freeBytes?: number;
+  /** 保存先フォルダ (001 Camera/Footage) があるか = 取り込み先の候補 */
+  hasFootageRoot: boolean;
+}
+
+function diskutilField(info: string, label: string): string | undefined {
+  const line = info.split("\n").find((l) => l.trim().startsWith(`${label}:`));
+  return line ? line.slice(line.indexOf(":") + 1).trim() : undefined;
+}
+
+/** マウント中のボリューム一覧 (設定画面の SSD 選択用)。取り込み先の候補を先頭にする */
+export async function listVolumes(volumesDir = "/Volumes"): Promise<VolumeInfo[]> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(volumesDir);
+  } catch {
+    return [];
+  }
+  const results = await Promise.all(
+    entries.map(async (entry): Promise<VolumeInfo | undefined> => {
+      const vol = path.join(volumesDir, entry);
+      try {
+        // 起動ディスクへのシンボリックリンク (Macintosh HD) などは除く
+        if (!(await fs.lstat(vol)).isDirectory()) return undefined;
+        const info = (await run("/usr/sbin/diskutil", ["info", vol])).stdout;
+        const uuid = diskutilField(info, "Volume UUID");
+        if (!uuid) return undefined;
+        let freeBytes: number | undefined;
+        try {
+          freeBytes = await getFreeBytes(vol);
+        } catch {
+          freeBytes = undefined;
+        }
+        return {
+          uuid,
+          name: diskutilField(info, "Volume Name") || entry,
+          mount: diskutilField(info, "Mount Point") || vol,
+          internal: diskutilField(info, "Device Location") === "Internal",
+          freeBytes,
+          hasFootageRoot: await isDirectory(path.join(vol, SSD_SUBPATH)),
+        };
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  return results
+    .filter((v): v is VolumeInfo => v !== undefined)
+    .sort((a, b) => Number(b.hasFootageRoot) - Number(a.hasFootageRoot) || a.name.localeCompare(b.name));
+}

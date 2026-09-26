@@ -51,11 +51,16 @@ export interface RunState {
   fatalError?: string;
   currentDevice?: string;
   startedAt: number;
+  /** 最初のファイルの転送を始めた時刻 (速度計算用。フォルダ準備の時間を含めない) */
+  transferStartedAt?: number;
   finishedAt?: number;
+  /** スキップした日付を除いた合計 */
   totalFiles: number;
   totalBytes: number;
   doneFiles: number;
   doneBytes: number;
+  /** 転送に失敗したファイルのバイト数 (処理済みとして進捗に含める) */
+  failedBytes?: number;
   cancelRequested: boolean;
   logFile?: string;
 }
@@ -88,6 +93,13 @@ export interface RunInput {
 }
 
 class AbortError extends Error {}
+
+function isSkipped(plan: Plan | undefined): boolean {
+  return !plan || plan.kind === "skip";
+}
+
+/** 履歴画面用に保存する実行結果 (ログ本文は別ファイル) */
+export type RunSummary = Omit<RunState, "log"> & { version: 1; ssdMount: string; footageRoot: string };
 
 /**
  * デバイス単位の容量チェック。問題なければ null。
@@ -141,6 +153,8 @@ export class TransferRun {
   private state: RunState;
   private readonly listeners = new Set<(state: RunState) => void>();
   private child: ChildProcess | undefined;
+  /** この実行で作った新規プロジェクト (Tier/日付-タイトル → パス)。同じ日の別デバイスは同じフォルダを使う */
+  private readonly createdProjects = new Map<string, string>();
   private readonly input: RunInput;
   private readonly hooks: RunHooks;
 
@@ -151,7 +165,8 @@ export class TransferRun {
       id: g.id,
       deviceName: g.device.name,
       date: g.date,
-      status: "pending",
+      // スキップする日付は最初から skipped にして、合計・進捗に含めない
+      status: isSkipped(input.plans[g.id]) ? "skipped" : "pending",
       totalFiles: g.files.length,
       totalBytes: g.totalBytes,
       doneFiles: 0,
@@ -165,10 +180,11 @@ export class TransferRun {
       log: [],
       failed: [],
       startedAt: Date.now(),
-      totalFiles: groups.reduce((s, g) => s + g.totalFiles, 0),
-      totalBytes: groups.reduce((s, g) => s + g.totalBytes, 0),
+      totalFiles: groups.filter((g) => g.status !== "skipped").reduce((s, g) => s + g.totalFiles, 0),
+      totalBytes: groups.filter((g) => g.status !== "skipped").reduce((s, g) => s + g.totalBytes, 0),
       doneFiles: 0,
       doneBytes: 0,
+      failedBytes: 0,
       cancelRequested: false,
     };
   }
@@ -316,7 +332,9 @@ export class TransferRun {
   private async checkSpace(device: DetectedDevice, deviceGroups: DateGroup[]): Promise<void> {
     const { ctx, settings } = this.input;
     const freeBytes = await getFreeBytes(ctx.mount);
-    const info = computeSpaceInfo(device.name, deviceGroups, settings.spaceMarginBytes, freeBytes);
+    // スキップする日付は容量の計算に含めない
+    const transferring = deviceGroups.filter((g) => !isSkipped(this.input.plans[g.id]));
+    const info = computeSpaceInfo(device.name, transferring, settings.spaceMarginBytes, freeBytes);
     if (!info) return;
 
     this.log(
@@ -360,7 +378,15 @@ export class TransferRun {
       projectDir = plan.projectDir;
       this.log(`  ⚡️ 既存プロジェクトを使用: ${plan.projectName}`);
     } else {
-      projectDir = await this.createNewProject(g.date, plan.title, plan.tier);
+      const key = `${plan.tier}/${g.date}-${plan.title}`;
+      const created = this.createdProjects.get(key);
+      if (created) {
+        projectDir = created;
+        this.log(`  ⚡️ 今回作成したプロジェクトを使用: ${plan.tier}/${path.basename(created)}`);
+      } else {
+        projectDir = await this.createNewProject(g.date, plan.title, plan.tier);
+        this.createdProjects.set(key, projectDir);
+      }
     }
 
     // 転送先決定 (ここでフォルダだけ先に準備する)
@@ -470,6 +496,7 @@ export class TransferRun {
     if (!destDir || !projectDir) return;
 
     progress.status = "transferring";
+    this.state.transferStartedAt ??= Date.now();
     this.log(`🚀 [ ${g.device.name} ] ${g.date} -> ${destDir}`);
     this.emit();
 
@@ -508,6 +535,7 @@ export class TransferRun {
       } else {
         progress.failedFiles += 1;
         progress.failedNames.push(file.name);
+        this.state.failedBytes = (this.state.failedBytes ?? 0) + file.size;
         this.state.failed.push(`${g.device.name}: ${file.name} (${formatGib(file.size)})`);
       }
       progress.currentFile = undefined;
@@ -596,6 +624,19 @@ export class TransferRun {
       const file = path.join(this.input.logDir, `newvlog-${stamp}.log`);
       await fs.writeFile(file, `${this.state.log.join("\n")}\n`, "utf8");
       this.state.logFile = file;
+
+      // 履歴画面用の要約。書きかけを読まれないよう一時ファイルから rename する
+      const snapshot: Partial<RunState> = this.snapshot();
+      delete snapshot.log;
+      const summary: RunSummary = {
+        ...(snapshot as Omit<RunState, "log">),
+        version: 1,
+        ssdMount: this.input.ctx.mount,
+        footageRoot: this.input.ctx.footageRoot,
+      };
+      const json = file.replace(/\.log$/, ".json");
+      await fs.writeFile(`${json}.tmp`, JSON.stringify(summary), "utf8");
+      await fs.rename(`${json}.tmp`, json);
     } catch {
       // ログ保存の失敗は転送結果に影響しない
     }
