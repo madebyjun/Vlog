@@ -153,6 +153,8 @@ export class TransferRun {
   private state: RunState;
   private readonly listeners = new Set<(state: RunState) => void>();
   private child: ChildProcess | undefined;
+  /** この実行で作った新規プロジェクト (Tier/日付-タイトル → パス)。同じ日の別デバイスは同じフォルダを使う */
+  private readonly createdProjects = new Map<string, string>();
   private readonly input: RunInput;
   private readonly hooks: RunHooks;
 
@@ -376,7 +378,15 @@ export class TransferRun {
       projectDir = plan.projectDir;
       this.log(`  ⚡️ 既存プロジェクトを使用: ${plan.projectName}`);
     } else {
-      projectDir = await this.createNewProject(g.date, plan.title, plan.tier);
+      const key = `${plan.tier}/${g.date}-${plan.title}`;
+      const created = this.createdProjects.get(key);
+      if (created) {
+        projectDir = created;
+        this.log(`  ⚡️ 今回作成したプロジェクトを使用: ${plan.tier}/${path.basename(created)}`);
+      } else {
+        projectDir = await this.createNewProject(g.date, plan.title, plan.tier);
+        this.createdProjects.set(key, projectDir);
+      }
     }
 
     // 転送先決定 (ここでフォルダだけ先に準備する)

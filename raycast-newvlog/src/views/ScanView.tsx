@@ -1,4 +1,14 @@
-import { Action, ActionPanel, Color, Icon, Keyboard, List, launchCommand, LaunchType, popToRoot } from "@raycast/api";
+import {
+  Action,
+  ActionPanel,
+  Color,
+  Icon,
+  Keyboard,
+  List,
+  launchCommand,
+  LaunchType,
+  useNavigation,
+} from "@raycast/api";
 import path from "node:path";
 import { ReactNode, useCallback, useEffect, useState } from "react";
 import { loadRaycastSettings } from "../lib/runtime";
@@ -37,6 +47,7 @@ async function performScan(settings: Settings): Promise<ScanData> {
 
 export function ScanView({ onStarted }: { onStarted: () => void }) {
   const [state, setState] = useState<ScanState>({ status: "loading" });
+  const { pop } = useNavigation();
 
   const rescan = useCallback(async () => {
     setState({ status: "loading" });
@@ -83,7 +94,7 @@ export function ScanView({ onStarted }: { onStarted: () => void }) {
         target={
           <SettingsForm
             onSaved={() => {
-              void popToRoot();
+              pop();
               void rescan();
             }}
           />

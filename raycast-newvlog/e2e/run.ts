@@ -23,7 +23,7 @@ import {
   serializeSpec,
   startJob,
 } from "../src/lib/job";
-import { Plan, suggestPlan } from "../src/lib/plan";
+import { Plan, applyPlan, suggestPlan } from "../src/lib/plan";
 import { progressStats } from "../src/lib/progress";
 import { DateGroup, detectDevices, scanDevice } from "../src/lib/scan";
 import {
@@ -884,6 +884,189 @@ async function scenarioSuggestPlan(): Promise<void> {
   check("[#25] 既存が 2 つ以上なら未決定のまま", two === undefined, JSON.stringify(two));
 }
 
+// ---------- K. 同じ撮影日の複数デバイス ----------
+
+const MIC_FILES = 10;
+const MIC_BYTES = 16 * 1024;
+
+/** 偽の DJI Mic を追加する (Osmo の 1 日目と同じ撮影日) */
+function addMic(env: Env): void {
+  const src = path.join(env.volumes, "MIC", "DJI_Audio_001");
+  fs.mkdirSync(src, { recursive: true });
+  const payload = Buffer.alloc(MIC_BYTES, 3);
+  for (let i = 0; i < MIC_FILES; i++) {
+    fs.writeFileSync(path.join(src, `DJI_29_20260920_17${String(i).padStart(2, "0")}00.WAV`), payload);
+  }
+}
+
+/** Tier フォルダ内の「2026-09-20-*」プロジェクト */
+function projectsOn(env: Env, tier: string, date = "2026-09-20"): string[] {
+  const dir = path.join(env.ctx.footageRoot, tier);
+  return fs.existsSync(dir)
+    ? fs
+        .readdirSync(dir)
+        .filter((n) => n.startsWith(`${date}-`))
+        .sort()
+    : [];
+}
+
+async function runToEnd(env: Env, spec: JobSpec): Promise<RunState | undefined> {
+  await startJob({ paths: env.paths, workerScript: WORKER, nodePath: nodePath(), spec });
+  const done = await waitFor(env, (s) => s.kind !== "running" && s.kind !== "starting");
+  return done.kind === "finished" ? done.state : undefined;
+}
+
+async function scenarioSameDayDevices(): Promise<void> {
+  scenario = "K. 同じ撮影日の複数デバイス (#29〜#32)";
+  console.log(`\n${scenario}`);
+
+  // #30: 自動提案のまま転送すると、同日の Osmo と Mic が 1 つの新規プロジェクトに入る
+  {
+    const env = makeEnv("k-shared");
+    addMic(env);
+    const { spec, groups } = await scan(env);
+    const sameDay = groups.filter((g) => g.date === "2026-09-20");
+    check("同じ撮影日のグループが 2 デバイス分ある", sameDay.length === 2, sameDay.map((g) => g.id).join(", "));
+    spec.input.plans = {};
+    for (const g of groups) {
+      const plan = suggestPlan(g, env.settings);
+      if (plan) spec.input.plans[g.id] = plan;
+    }
+    check(
+      "自動提案では同日の 2 デバイスが同じ新規プランになる",
+      sameDay.every(
+        (g) => JSON.stringify(spec.input.plans[g.id]) === JSON.stringify(spec.input.plans[sameDay[0].id]),
+      ) && spec.input.plans[sameDay[0].id]?.kind === "new",
+    );
+    const state = await runToEnd(env, spec);
+    const projects = projectsOn(env, "TIER_2__STORE");
+    check("転送が完了する", state?.phase === "finished" && state.failed.length === 0, `${state?.phase}`);
+    check(
+      "[#30] 新規プロジェクトは 1 つだけ (-1 ができない)",
+      projects.join() === "2026-09-20-NewProject",
+      projects.join(", "),
+    );
+    const project = path.join(env.ctx.footageRoot, "TIER_2__STORE", "2026-09-20-NewProject");
+    check(
+      "[#30] 1 つのプロジェクトに両デバイスのサブフォルダが入る",
+      fs.readdirSync(path.join(project, "DJI_001")).length === FILES_PER_DAY &&
+        fs.readdirSync(path.join(project, "DJI_Audio_001")).length === MIC_FILES,
+    );
+    check(
+      "[#30] 両デバイスの進捗が同じプロジェクトを指す",
+      state?.groups.filter((g) => g.date === "2026-09-20").every((g) => g.projectDir === project) === true,
+    );
+    check(
+      "[#30] 共有プロジェクトにテンプレートがコピーされている",
+      fs.existsSync(path.join(project, "Edit/project.txt")),
+    );
+  }
+
+  // #31: 同名フォルダが既にあれば、両デバイスとも同じ連番 (-1) に入る
+  {
+    const env = makeEnv("k-suffix");
+    addMic(env);
+    fs.mkdirSync(path.join(env.ctx.footageRoot, "TIER_3__TEMP", "2026-09-20-Trip"), { recursive: true });
+    const { spec, groups } = await scan(env);
+    for (const g of groups) {
+      if (g.date === "2026-09-20") spec.input.plans[g.id] = { kind: "new", title: "Trip", tier: "TIER_3__TEMP" };
+    }
+    const state = await runToEnd(env, spec);
+    const projects = projectsOn(env, "TIER_3__TEMP");
+    check(
+      "[#31] 既存の同名フォルダがあっても、共有プロジェクトは -1 の 1 つだけ",
+      state?.phase === "finished" && projects.join() === "2026-09-20-Trip,2026-09-20-Trip-1",
+      projects.join(", "),
+    );
+    const shared = path.join(env.ctx.footageRoot, "TIER_3__TEMP", "2026-09-20-Trip-1");
+    check(
+      "[#31] 両デバイスが -1 に入る",
+      fs.existsSync(path.join(shared, "DJI_001")) && fs.existsSync(path.join(shared, "DJI_Audio_001")),
+    );
+  }
+
+  // #32: タイトルが違えば別プロジェクト
+  {
+    const env = makeEnv("k-separate");
+    addMic(env);
+    const { spec, groups } = await scan(env);
+    for (const g of groups) {
+      if (g.date === "2026-09-20")
+        spec.input.plans[g.id] = {
+          kind: "new",
+          title: g.device.name.startsWith("DJI_Mic") ? "Audio" : "Video",
+          tier: "TIER_2__STORE",
+        };
+    }
+    const state = await runToEnd(env, spec);
+    const projects = projectsOn(env, "TIER_2__STORE");
+    check(
+      "[#32] タイトルが違えば別々のプロジェクトになる",
+      state?.phase === "finished" && projects.join() === "2026-09-20-Audio,2026-09-20-Video",
+      projects.join(", "),
+    );
+  }
+
+  // #32: プラン変更の伝播ルール
+  {
+    const groups = [
+      { id: "osmo|20", date: "2026-09-20" },
+      { id: "mic|20", date: "2026-09-20" },
+      { id: "osmo|21", date: "2026-09-21" },
+    ];
+    const base: Plan = { kind: "new", title: "NewProject", tier: "TIER_2__STORE" };
+    const trip: Plan = { kind: "new", title: "Trip", tier: "TIER_1__KEEP" };
+    const other: Plan = { kind: "existing", projectDir: "/x/Y", projectName: "Y" };
+    const same = (a: Plan | undefined, b: Plan | undefined) => JSON.stringify(a) === JSON.stringify(b);
+
+    const renamed = applyPlan({ "osmo|20": base, "mic|20": base, "osmo|21": base }, groups, "osmo|20", trip);
+    check(
+      "[#32] 共有していた新規プロジェクトのタイトルを変えると、同日の別デバイスも変わる",
+      same(renamed["osmo|20"], trip) && same(renamed["mic|20"], trip),
+    );
+    check("[#32] 別の撮影日には伝播しない", same(renamed["osmo|21"], base));
+
+    const filled = applyPlan({}, groups, "osmo|20", other);
+    check("[#32] 同日の未決定のデバイスにも同じ転送先が入る", same(filled["mic|20"], other) && !filled["osmo|21"]);
+
+    const separate = applyPlan({ "osmo|20": base, "mic|20": other }, groups, "osmo|20", trip);
+    check("[#32] 別の転送先を選んでいたデバイスは変えない", same(separate["mic|20"], other));
+
+    const skipped = applyPlan({ "osmo|20": base, "mic|20": base }, groups, "osmo|20", { kind: "skip" });
+    check("[#32] スキップは伝播しない", skipped["osmo|20"]?.kind === "skip" && same(skipped["mic|20"], base));
+
+    const cleared = applyPlan({ "osmo|20": base, "mic|20": base }, groups, "osmo|20", undefined);
+    check("[#32] 未決定に戻すのはその日付だけ", !cleared["osmo|20"] && same(cleared["mic|20"], base));
+
+    const afterSkip = applyPlan({ "osmo|20": { kind: "skip" }, "mic|20": { kind: "skip" } }, groups, "osmo|20", trip);
+    check(
+      "[#32] スキップ同士は「共有」とみなさない",
+      same(afterSkip["osmo|20"], trip) && afterSkip["mic|20"]?.kind === "skip",
+    );
+  }
+
+  // #29: 画面の戻り方 (ソースに popToRoot の呼び出しが無い)
+  {
+    const srcDir = path.join(ROOT, "src");
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (/\.tsx?$/.test(e.name) && /\bpopToRoot\s*\(/.test(fs.readFileSync(full, "utf8"))) {
+          offenders.push(path.relative(ROOT, full));
+        }
+      }
+    };
+    walk(srcDir);
+    check(
+      "[#29] popToRoot() を呼んでいない (検索画面まで戻ってプランが消えるため)",
+      offenders.length === 0,
+      offenders.join(", "),
+    );
+  }
+}
+
 // ---------- レポート ----------
 
 function writeReport(startedAt: Date): boolean {
@@ -971,6 +1154,7 @@ async function main(): Promise<void> {
     scenarioSkipAndProgress,
     scenarioHistoryFiles,
     scenarioSuggestPlan,
+    scenarioSameDayDevices,
   ]) {
     try {
       await s();

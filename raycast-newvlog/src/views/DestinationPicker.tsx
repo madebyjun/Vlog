@@ -1,4 +1,4 @@
-import { Action, ActionPanel, Color, Icon, List, popToRoot } from "@raycast/api";
+import { Action, ActionPanel, Color, Icon, List, useNavigation } from "@raycast/api";
 import { TIER_LABELS, Tier } from "../lib/config";
 import { Plan } from "../lib/plan";
 import { DateGroup } from "../lib/scan";
@@ -16,9 +16,11 @@ const CURRENT = { icon: { source: Icon.Checkmark, tintColor: Color.Green }, tool
 
 /** 日付ごとの転送先を選ぶ画面 (Enter で開く) */
 export function DestinationPicker({ group, plan, defaultTitle, defaultTier, onChange }: Props) {
+  const { pop } = useNavigation();
+  // popToRoot は Raycast の検索画面まで戻ってプラン画面の状態が消えるので、この画面だけ閉じる
   const choose = (next: Plan) => {
     onChange(next);
-    void popToRoot();
+    pop();
   };
 
   return (
@@ -65,7 +67,11 @@ export function DestinationPicker({ group, plan, defaultTitle, defaultTier, onCh
                     defaultTitle={defaultTitle}
                     defaultTier={defaultTier}
                     initial={plan?.kind === "new" ? { title: plan.title, tier: plan.tier } : undefined}
-                    onSubmit={onChange}
+                    onSubmit={(next) => {
+                      // フォームは自分を閉じるので、続けてこのピッカーも閉じてプラン画面へ戻る
+                      onChange(next);
+                      pop();
+                    }}
                   />
                 }
               />

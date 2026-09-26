@@ -9,7 +9,7 @@ import {
   List,
   Toast,
   confirmAlert,
-  popToRoot,
+  useNavigation,
   showToast,
 } from "@raycast/api";
 import path from "node:path";
@@ -18,7 +18,7 @@ import { TIER_LABELS } from "../lib/config";
 import { SpaceInfo, computeSpaceInfo } from "../lib/engine";
 import { formatGib } from "../lib/format";
 import { startJob } from "../lib/job";
-import { Plan, describePlan, suggestPlan } from "../lib/plan";
+import { Plan, applyPlan, describePlan, samePlan, suggestPlan } from "../lib/plan";
 import { logDirPath, nodeBinaryPath, raycastJobPaths, refreshMenuBar, workerScriptPath } from "../lib/runtime";
 import { DateGroup } from "../lib/scan";
 import { getFreeBytes } from "../lib/ssd";
@@ -101,13 +101,10 @@ export function PlanView({ data, onRescan, onStarted }: Props) {
   const [plans, setPlans] = useState<Record<string, Plan>>(suggestions);
   const [starting, setStarting] = useState(false);
 
+  const { pop } = useNavigation();
+
   const setPlan = (id: string, plan: Plan | undefined) => {
-    setPlans((prev) => {
-      const next = { ...prev };
-      if (plan) next[id] = plan;
-      else delete next[id];
-      return next;
-    });
+    setPlans((prev) => applyPlan(prev, data.groups, id, plan));
   };
 
   const summary = useMemo(() => {
@@ -220,7 +217,7 @@ export function PlanView({ data, onRescan, onStarted }: Props) {
         target={
           <SettingsForm
             onSaved={() => {
-              void popToRoot();
+              pop();
               onRescan();
             }}
           />
@@ -305,6 +302,15 @@ export function PlanView({ data, onRescan, onStarted }: Props) {
                 key={group.id}
                 group={group}
                 plan={plans[group.id]}
+                sharedWith={data.groups
+                  .filter(
+                    (g) =>
+                      g.id !== group.id &&
+                      g.date === group.date &&
+                      isTransferring(plans[group.id]) &&
+                      samePlan(plans[g.id], plans[group.id]),
+                  )
+                  .map((g) => g.device.name)}
                 suggestion={suggestions[group.id]}
                 data={data}
                 onPlanChange={(plan) => setPlan(group.id, plan)}
@@ -321,6 +327,8 @@ export function PlanView({ data, onRescan, onStarted }: Props) {
 interface GroupItemProps {
   group: DateGroup;
   plan: Plan | undefined;
+  /** 同じプロジェクトに入る、同じ撮影日の別デバイス */
+  sharedWith: string[];
   suggestion: Plan | undefined;
   data: ScanData;
   onPlanChange: (plan: Plan | undefined) => void;
@@ -348,7 +356,7 @@ function destinationText(group: DateGroup, plan: Plan | undefined, footageRoot: 
   }
 }
 
-function GroupItem({ group, plan, suggestion, data, onPlanChange, commonActions }: GroupItemProps) {
+function GroupItem({ group, plan, sharedWith, suggestion, data, onPlanChange, commonActions }: GroupItemProps) {
   const { settings } = data;
   const tag = planTag(plan);
   const times = group.files.map((f) => f.time).sort();
@@ -375,6 +383,13 @@ function GroupItem({ group, plan, suggestion, data, onPlanChange, commonActions 
               />
               {plan && plan.kind !== "skip" && (
                 <List.Item.Detail.Metadata.Label title="サブフォルダ" text={group.device.destFolderName} />
+              )}
+              {sharedWith.length > 0 && (
+                <List.Item.Detail.Metadata.Label
+                  title="同じプロジェクト"
+                  text={`${sharedWith.join("、")} も同じフォルダに入ります`}
+                  icon={Icon.Link}
+                />
               )}
               <List.Item.Detail.Metadata.Separator />
               <List.Item.Detail.Metadata.Label title="デバイス" text={group.device.name} />

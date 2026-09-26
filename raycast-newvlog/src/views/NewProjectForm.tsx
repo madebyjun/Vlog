@@ -1,4 +1,4 @@
-import { Action, ActionPanel, Form, Icon, popToRoot } from "@raycast/api";
+import { Action, ActionPanel, Form, Icon, useNavigation } from "@raycast/api";
 import { useState } from "react";
 import { TIER_DESCRIPTIONS, TIER_FOLDERS, TIER_LABELS, Tier } from "../lib/config";
 import { Plan } from "../lib/plan";
@@ -14,6 +14,7 @@ interface Props {
 
 /** スクリプトの「タイトルを入力」「Select storage tier」に相当 */
 export function NewProjectForm({ group, defaultTitle, defaultTier, initial, onSubmit }: Props) {
+  const { pop } = useNavigation();
   // 既定タイトルのままなら空欄から始める (placeholder で既定値を見せる)
   const [title, setTitle] = useState(initial && initial.title !== defaultTitle ? initial.title : "");
   const [tier, setTier] = useState<Tier>(initial?.tier ?? defaultTier);
@@ -26,8 +27,9 @@ export function NewProjectForm({ group, defaultTitle, defaultTier, initial, onSu
       setTitleError("/ は使えません");
       return;
     }
+    // このフォームだけ閉じる (呼び出し元がピッカーなら、ピッカー側でもう 1 階層戻す)
+    pop();
     onSubmit({ kind: "new", title: effectiveTitle, tier });
-    void popToRoot();
   };
 
   return (

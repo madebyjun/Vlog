@@ -38,3 +38,34 @@ export function suggestPlan(
   }
   return undefined;
 }
+
+export function samePlan(a: Plan | undefined, b: Plan | undefined): boolean {
+  return a !== undefined && b !== undefined && JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * 日付のプランを変える。同じ撮影日の別デバイスは同じプロジェクトに入れるのが普通なので、
+ * 同じ日付で「未決定」または「変更前と同じプラン (= 共有していた)」の日付にも同じプランを適用する。
+ * スキップと未決定に戻す操作はその日付だけに効く。
+ */
+export function applyPlan(
+  plans: Record<string, Plan>,
+  groups: Pick<DateGroup, "id" | "date">[],
+  id: string,
+  plan: Plan | undefined,
+): Record<string, Plan> {
+  const next = { ...plans };
+  const prev = plans[id];
+  if (plan) next[id] = plan;
+  else delete next[id];
+  if (!plan || plan.kind === "skip") return next;
+
+  const date = groups.find((g) => g.id === id)?.date;
+  for (const g of groups) {
+    if (g.id === id || g.date !== date) continue;
+    const current = plans[g.id];
+    const shared = prev !== undefined && prev.kind !== "skip" && samePlan(current, prev);
+    if (current === undefined || shared) next[g.id] = plan;
+  }
+  return next;
+}
