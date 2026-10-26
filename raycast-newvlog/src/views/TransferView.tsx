@@ -66,6 +66,11 @@ export function TransferView({ paths, onRestart }: Props) {
   return <TransferProgress paths={paths} state={state} onRestart={onRestart} />;
 }
 
+// Metadata.Label をそのまま使わないのは、Raycast が text の変化で幅を測り直さず「1.5 GiB....0 GiB」のように省略したままにするため
+function LiveLabel(props: List.Item.Detail.Metadata.Label.Props & { text: string }) {
+  return <List.Item.Detail.Metadata.Label key={props.text} {...props} />;
+}
+
 /** 経過時間・残り時間の表示を 1 秒ごとに進める */
 function useNow(active: boolean): number {
   const [now, setNow] = useState(Date.now());
@@ -224,31 +229,26 @@ function TransferProgress({ paths, state, onRestart }: Props & { state: RunState
                       color={OUTCOME[outcome].color}
                     />
                   </List.Item.Detail.Metadata.TagList>
-                  <List.Item.Detail.Metadata.Label
+                  <LiveLabel
                     title="進捗"
                     text={formatPercent(stats.ratio)}
                     icon={getProgressIcon(stats.ratio, OUTCOME[outcome].color)}
                   />
-                  <List.Item.Detail.Metadata.Label title="ファイル" text={`${state.doneFiles} / ${state.totalFiles}`} />
-                  <List.Item.Detail.Metadata.Label
+                  <LiveLabel title="ファイル" text={`${state.doneFiles} / ${state.totalFiles}`} />
+                  <LiveLabel
                     title="サイズ"
                     text={`${formatGib(stats.processedBytes)} / ${formatGib(stats.totalBytes)}`}
                   />
                   {stats.bytesPerSec !== undefined && (
-                    <List.Item.Detail.Metadata.Label
-                      title={running ? "速度" : "平均速度"}
-                      text={formatSpeed(stats.bytesPerSec)}
-                    />
+                    <LiveLabel title={running ? "速度" : "平均速度"} text={formatSpeed(stats.bytesPerSec)} />
                   )}
-                  {stats.etaMs !== undefined && (
-                    <List.Item.Detail.Metadata.Label title="残り時間" text={formatEta(stats.etaMs)} />
-                  )}
-                  <List.Item.Detail.Metadata.Label title="経過時間" text={formatDuration(stats.elapsedMs)} />
+                  {stats.etaMs !== undefined && <LiveLabel title="残り時間" text={formatEta(stats.etaMs)} />}
+                  <LiveLabel title="経過時間" text={formatDuration(stats.elapsedMs)} />
                   {current?.currentFile && (
                     <>
                       <List.Item.Detail.Metadata.Separator />
-                      <List.Item.Detail.Metadata.Label title="転送中のファイル" text={current.currentFile} />
-                      <List.Item.Detail.Metadata.Label
+                      <LiveLabel title="転送中のファイル" text={current.currentFile} />
+                      <LiveLabel
                         title=""
                         text={`${formatSize(current.currentFileBytes ?? 0)} / ${formatSize(current.currentFileSize ?? 0)}`}
                       />
@@ -257,7 +257,7 @@ function TransferProgress({ paths, state, onRestart }: Props & { state: RunState
                   {state.failed.length > 0 && (
                     <>
                       <List.Item.Detail.Metadata.Separator />
-                      <List.Item.Detail.Metadata.Label
+                      <LiveLabel
                         title="失敗"
                         text={`${state.failed.length} ファイル`}
                         icon={{ source: Icon.Warning, tintColor: Color.Orange }}
@@ -267,11 +267,7 @@ function TransferProgress({ paths, state, onRestart }: Props & { state: RunState
                   {running && (
                     <>
                       <List.Item.Detail.Metadata.Separator />
-                      <List.Item.Detail.Metadata.Label
-                        title=""
-                        text="Raycast を閉じても転送は続きます"
-                        icon={Icon.Info}
-                      />
+                      <LiveLabel title="" text="Raycast を閉じても転送は続きます" icon={Icon.Info} />
                     </>
                   )}
                 </List.Item.Detail.Metadata>
@@ -322,24 +318,22 @@ function GroupItem({ group: g, globalActions }: { group: GroupProgress; globalAc
           }
           metadata={
             <List.Item.Detail.Metadata>
-              <List.Item.Detail.Metadata.Label title="状態" text={groupLabel(g.status)} icon={groupIcon(g)} />
+              <LiveLabel title="状態" text={groupLabel(g.status)} icon={groupIcon(g)} />
               {g.status !== "skipped" && (
                 <>
-                  <List.Item.Detail.Metadata.Label title="進捗" text={formatPercent(ratio)} />
-                  <List.Item.Detail.Metadata.Label title="ファイル" text={`${g.doneFiles} / ${g.totalFiles}`} />
-                  <List.Item.Detail.Metadata.Label
+                  <LiveLabel title="進捗" text={formatPercent(ratio)} />
+                  <LiveLabel title="ファイル" text={`${g.doneFiles} / ${g.totalFiles}`} />
+                  <LiveLabel
                     title="サイズ"
                     text={`${formatGib(g.doneBytes + (g.currentFileBytes ?? 0))} / ${formatGib(g.totalBytes)}`}
                   />
                 </>
               )}
-              {g.currentFile && <List.Item.Detail.Metadata.Label title="転送中のファイル" text={g.currentFile} />}
+              {g.currentFile && <LiveLabel title="転送中のファイル" text={g.currentFile} />}
               <List.Item.Detail.Metadata.Separator />
-              <List.Item.Detail.Metadata.Label title="デバイス" text={g.deviceName} />
-              {g.projectDir && (
-                <List.Item.Detail.Metadata.Label title="プロジェクト" text={path.basename(g.projectDir)} />
-              )}
-              {g.destDir && <List.Item.Detail.Metadata.Label title="転送先" text={g.destDir} />}
+              <LiveLabel title="デバイス" text={g.deviceName} />
+              {g.projectDir && <LiveLabel title="プロジェクト" text={path.basename(g.projectDir)} />}
+              {g.destDir && <LiveLabel title="転送先" text={g.destDir} />}
             </List.Item.Detail.Metadata>
           }
         />
